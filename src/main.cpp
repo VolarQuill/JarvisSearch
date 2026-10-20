@@ -892,6 +892,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_ERASEBKGND:
             return 1;   //  the whole surface is painted, there is no background
 
+        case WM_PAINT:
+            //  The bar is an ordinary window, so the surface that Present
+            //  prepared is put on the screen here.  Without this the window
+            //  stays empty and nothing of the bar is ever seen.
+            st->renderer.Blit(hwnd);
+            return 0;
+
         case WM_NCHITTEST:
             //  While the bar rests on the desktop it lets every click
             //  through to whatever is underneath it.
