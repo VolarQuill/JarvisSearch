@@ -17,19 +17,6 @@ that talks to the shell directly.
 
 ![the bar](docs/preview.png)
 
-```
-+------------------------------------------------------------------+
-|  (o) SEARCH APPS OR THE WEB                                  12:41|
-| +---------------------------+  +-------------------------------+ |
-| | APPLICATIONS              |  | WEB SEARCH                    | |
-| | > Visual Studio Code      |  |   GOOGLE              WEB    | |
-| |   Google Chrome           |  |   GOOGLE IMAGES      IMAGES | |
-| |   Windows Terminal        |  |   BING                WEB    | |
-| +---------------------------+  +-------------------------------+ |
-|  ENTER LAUNCH   TAB SWITCH   ESC CLEAR   CTRL+1-9 QUICK          |
-+------------------------------------------------------------------+
-```
-
 ---
 
 ## Install
@@ -59,14 +46,14 @@ JarvisSearch.exe --uninstall-autostart
 ```
 
 An edited `config.txt` is never overwritten by the installer. When the
-installed copy differs from the shipped one, it is left exactly as it is and
+installed copy differs from the shipped one it is left exactly as it is, and
 a snapshot is written next to it as `config.txt.bak`. Pass `-Force` to
 replace it anyway; the snapshot is still written first.
 
 ## Build
 
-The project is plain C++17 with the Win32 API and GDI+. It builds with the
-MSYS2 **UCRT64** toolchain:
+Plain C++17 with the Win32 API and GDI+. It builds with the MSYS2 **UCRT64**
+toolchain:
 
 ```sh
 cd /c/Users/you/projects/JarvisSearch
@@ -129,7 +116,7 @@ setting has a built in default, so the file is optional.
 | `hotkey` | `Ctrl+Alt+Space` | global hotkey, `+` between the modifiers |
 | `default_browser` | *(empty)* | explicit browser for the web results, empty means the system default |
 
-## How it is put together
+## How it works
 
 ```
 src/jarvis.h        the shared types: config, app entries, providers, results
@@ -142,31 +129,19 @@ src/util.cpp        config files, paths, strings
 tools/acceptance.ps1 the test that drives the real program
 ```
 
-A few notes on the parts that are not obvious:
-
-**The window is layered.** The bar is drawn on a 32 bit ARGB surface which is
-converted to premultiplied alpha and pushed to the screen with
-`UpdateLayeredWindow(ULW_ALPHA)`. That is what gives the panel true per pixel
-transparency, and it is why the bar can sit on top of a browser without a
-rectangle around it.
-
-**The text input is hand written.** A child control cannot be composited into
-a layered window, so the query field is not a control at all: the characters
-come in through `WM_CHAR` and are kept in a string.
-
-**The applications are found in the shell.** The Start menu folders are
-walked for `.lnk` files, and the Store applications are read out of
-`shell:AppsFolder`. Icons are pulled from the shell with `SHGetFileInfo`, and
-a Store application is started through `IApplicationActivationManager`.
-
-**The matching is a subsequence match with a ranking.** An exact hit beats a
-prefix, a prefix beats a hit inside a word, a hit inside a word beats a
-scattered subsequence, and applications that are used often float up.
-
-**The idle cost is close to nothing.** The caret blinks at 2 Hz and the clock
-ticks once a second; nothing is redrawn in between and nothing is animated.
-The application list is built on a worker thread while the bar is already on
-the screen.
+* **The window is layered.** The bar is drawn on a 32 bit ARGB surface, turned
+  into premultiplied alpha and pushed to the screen with
+  `UpdateLayeredWindow(ULW_ALPHA)`, which is what gives the panel true per
+  pixel transparency.
+* **The text input is hand written.** A child control cannot be composited
+  into a layered window, so the query field is not a control: the characters
+  come in through `WM_CHAR` and are kept in a string.
+* **The applications come out of the shell.** The Start menu is walked for
+  `.lnk` files, the Store applications are read from `shell:AppsFolder`, and
+  a Store application is started through `IApplicationActivationManager`.
+* **The matching is a subsequence match with a ranking.** An exact hit beats
+  a prefix, a prefix beats a hit inside a word, and the applications that
+  are used often float up.
 
 ## Diagnostics
 
@@ -190,18 +165,8 @@ program steps aside.
 powershell -ExecutionPolicy Bypass -File .\tools\acceptance.ps1
 ```
 
-The keyboard is simulated by posting the window messages that the program
-would receive, so the test does not depend on which window happens to be in
-front. It does open a browser and start a notepad while it runs; pass
-`-SkipWeb` and `-SkipLaunch` to keep it away from your screen.
-
-## The interface
-
-The look follows the usual JARVIS palette: a near black navy panel, a cyan
-border, bright corner brackets, a segmented arc reactor left of the prompt,
-a faint grid across the background, letter spaced uppercase micro labels
-over the two panes and an amber accent used sparingly. Everything is set in a
-monospace face so that the columns line up.
+It does open a browser and start a notepad while it runs; pass `-SkipWeb`
+and `-SkipLaunch` to keep it away from your screen.
 
 ## License
 
