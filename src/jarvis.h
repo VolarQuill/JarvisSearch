@@ -50,7 +50,10 @@ struct Config {
     std::wstring statusText    = L"SYSTEM ONLINE";
 
     //  Geometry
-    std::wstring position      = L"top-center";
+    //  The sibling JARVIS HUD greeting card lives in the top left
+    //  corner, so the bar sits in the top right one: the two panels
+    //  must not sit on top of each other.
+    std::wstring position      = L"top-right";
     int         margin         = 24;    //  logical px from the work-area edge
     int         barWidth       = 680;   //  logical px
     int         barHeight      = 48;    //  logical px
