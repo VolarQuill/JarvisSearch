@@ -80,8 +80,18 @@ struct AppState {
     bool focused = false;
     //  True while the bar is in use: it is on top, it has the focus
     //  and it can be clicked.  When it is false the bar rests on the
-    //  desktop and lets the clicks through.
+    //  desktop.
     bool summoned = false;
+
+    //  Dragging the bar with the left mouse button.  The bar follows
+    //  the mouse as soon as it is moved far enough, so a click without
+    //  a movement is still a click.
+    bool  dragging = false;
+    bool  dragMoved = false;
+    int   dragStartX = 0, dragStartY = 0;      //  mouse, screen pixels
+    int   dragWindowX = 0, dragWindowY = 0;    //  window, screen pixels
+    int   dragX = 0, dragY = 0;                //  window, screen pixels
+
     bool caretOn = true;
     int  activePane = 0;
     int  appSelected = 0;
@@ -523,8 +533,38 @@ void ComputePosition(AppState& st, const Layout& lay, int& outX, int& outY) {
     if (st.cfg.posX >= 0) x = wa.left + (int)std::lround((float)st.cfg.posX * scale);
     if (st.cfg.posY >= 0) y = wa.top  + (int)std::lround((float)st.cfg.posY * scale);
 
+    //  While the bar is being dragged it stays where the mouse has
+    //  put it, whatever the config says.
+    if (st.dragging) {
+        outX = st.dragX;
+        outY = st.dragY;
+        return;
+    }
+
     outX = x;
     outY = y;
+}
+
+//  Remembers where the user has put the bar, so that it comes back in
+//  the same place the next time the machine starts.  The place is
+//  written into the config file next to the program, as pos_x and
+//  pos_y, in the same logical pixels the config uses.
+void SaveBarPosition(AppState& st, int screenX, int screenY) {
+    if (!st.hwnd) return;
+    HMONITOR mon = MonitorFromWindow(st.hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!mon) mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi;
+    ZeroMemory(&mi, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(mon, &mi);
+    const float scale = st.renderer.Scale();
+    const int posX = (int)std::lround((float)(screenX - mi.rcWork.left) / scale);
+    const int posY = (int)std::lround((float)(screenY - mi.rcWork.top) / scale);
+    st.cfg.posX = posX;
+    st.cfg.posY = posY;
+    const std::wstring path = ExeRelativePath(L"config.txt");
+    SaveConfigKey(path, L"pos_x", std::to_wstring(posX));
+    SaveConfigKey(path, L"pos_y", std::to_wstring(posY));
 }
 
 void Redraw(AppState& st) {
@@ -660,15 +700,10 @@ void RefreshDesktopBand(AppState& st) {
 //----------------------------------------------------------------------
 //  Summoning and dismissing
 //----------------------------------------------------------------------
-void SetClickThrough(AppState& st, bool clickThrough) {
-    if (!st.hwnd) return;
-    LONG_PTR ex = GetWindowLongPtrW(st.hwnd, GWL_EXSTYLE);
-    if (clickThrough)
-        ex |= WS_EX_TRANSPARENT;
-    else
-        ex &= ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
-    SetWindowLongPtrW(st.hwnd, GWL_EXSTYLE, ex);
-}
+//  The bar is never click through.  It rests on the desktop, but it
+//  has to be possible to take hold of it and drag it somewhere else,
+//  and a window that lets the clicks through never hears of the
+//  mouse.
 
 //  Brings the bar up: on top of everything, with the focus, ready to
 //  be typed into.
@@ -682,8 +717,9 @@ void Summon(AppState& st) {
     st.caret = (int)st.query.size();
     st.caretOn = true;
 
-    //  While it is in use the bar has to be clickable.
-    SetClickThrough(st, false);
+    //  The bar is clickable whenever it is on the screen: it has to
+    //  be possible to take hold of it and drag it somewhere else.
+
 
     //  The bar goes into the topmost band before it takes the
     //  foreground.  A window that is the foreground and is moved to
@@ -738,8 +774,6 @@ void Dismiss(AppState& st, const char* reason = "focus") {
     st.activePane = 0;
     st.showPanel = false;
     KillTimer(st.hwnd, kTimerCaret);
-
-    SetClickThrough(st, true);
 
     //  The focus has to go back to the window that had it, otherwise
     //  the keystrokes of the person at the keyboard would still land
@@ -1024,9 +1058,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_NCHITTEST:
-            //  While the bar rests on the desktop it lets every click
-            //  through to whatever is underneath it.
-            if (!st->summoned) return HTTRANSPARENT;
+            //  The bar always answers the mouse, so that it can be
+            //  taken hold of and dragged somewhere else while it
+            //  rests on the desktop.
+            return HTCLIENT;
+
+        case WM_MOUSEACTIVATE:
+            //  A bar that rests on the desktop must not take the
+            //  focus away from the program the person is working in.
+            //  It is only brought up when the button is let go
+            //  without a drag.
+            if (!st->summoned) return MA_NOACTIVATE;
             return DefWindowProcW(hwnd, msg, wp, lp);
 
         case WM_SETFOCUS:
@@ -1058,8 +1100,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;   //  the bar is not a menu
 
         case WM_LBUTTONDOWN: {
-            SetForegroundWindow(hwnd);
-            SetFocus(hwnd);
             const int x = GET_X_LPARAM(lp);
             const int y = GET_Y_LPARAM(lp);
             {
@@ -1067,6 +1107,34 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 snprintf(line, sizeof(line), "down at=%d,%d focused=%d", x, y, st->focused ? 1 : 0);
                 LogLine(*st, line);
             }
+
+            //  The bar can be dragged with the left button.  Where the
+            //  mouse went down and where the window is are kept, so
+            //  that the window can follow the mouse.
+            POINT cur;
+            cur.x = cur.y = 0;
+            GetCursorPos(&cur);
+            RECT wr;
+            wr.left = wr.top = wr.right = wr.bottom = 0;
+            GetWindowRect(hwnd, &wr);
+            st->dragging = true;
+            st->dragMoved = false;
+            st->dragStartX = cur.x;
+            st->dragStartY = cur.y;
+            st->dragWindowX = wr.left;
+            st->dragWindowY = wr.top;
+            st->dragX = wr.left;
+            st->dragY = wr.top;
+            SetCapture(hwnd);
+
+            //  A bar that is resting on the desktop must not take the
+            //  focus away from the program the person is working in.
+            //  It is only brought up when the button is let go
+            //  without a drag.
+            if (!st->summoned) return 0;
+
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
             const Hit hit = HitTest(*st, x, y);
             if (hit.kind == Hit::Bar) {
                 st->caret = (int)st->query.size();
@@ -1081,9 +1149,77 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
+        case WM_MOUSEMOVE: {
+            if (!st->dragging) return 0;
+            POINT cur;
+            cur.x = cur.y = 0;
+            GetCursorPos(&cur);
+            const int dx = cur.x - st->dragStartX;
+            const int dy = cur.y - st->dragStartY;
+            //  A few pixels of jitter are a click, not a drag.
+            if (!st->dragMoved && (dx > 4 || dx < -4 || dy > 4 || dy < -4))
+                st->dragMoved = true;
+            if (!st->dragMoved) return 0;
+
+            RECT wr;
+            wr.left = wr.top = wr.right = wr.bottom = 0;
+            GetWindowRect(hwnd, &wr);
+            const int width = wr.right - wr.left;
+            const int height = wr.bottom - wr.top;
+            int x = st->dragWindowX + dx;
+            int y = st->dragWindowY + dy;
+
+            //  The bar has to stay on the screen of the monitor it is
+            //  on.
+            HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi;
+            ZeroMemory(&mi, sizeof(mi));
+            mi.cbSize = sizeof(mi);
+            if (mon && GetMonitorInfoW(mon, &mi)) {
+                const RECT& work = mi.rcWork;
+                if (x < work.left) x = work.left;
+                if (y < work.top) y = work.top;
+                if (x + width > work.right) x = work.right - width;
+                if (y + height > work.bottom) y = work.bottom - height;
+            }
+            st->dragX = x;
+            st->dragY = y;
+            SetWindowPos(hwnd, nullptr, x, y, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
+
+        case WM_CAPTURECHANGED: {
+            //  The mouse was taken away, so the drag is over.
+            if (st->dragging) {
+                st->dragging = false;
+                if (st->dragMoved) SaveBarPosition(*st, st->dragX, st->dragY);
+            }
+            return 0;
+        }
+
         case WM_LBUTTONUP: {
             const int x = GET_X_LPARAM(lp);
             const int y = GET_Y_LPARAM(lp);
+            if (st->dragging) {
+                //  The drag is over before the capture is let go:
+                //  letting go sends WM_CAPTURECHANGED, which comes
+                //  straight back here.
+                st->dragging = false;
+                ReleaseCapture();
+                if (st->dragMoved) {
+                    //  The bar was moved: the place it was put in is
+                    //  remembered, and the drag is not a click.
+                    SaveBarPosition(*st, st->dragX, st->dragY);
+                    return 0;
+                }
+            }
+            if (!st->summoned) {
+                //  A click on the bar that rests on the desktop brings
+                //  it up.
+                Summon(*st);
+                return 0;
+            }
             const Hit hit = HitTest(*st, x, y);
             {
                 char line[512];
@@ -1414,9 +1550,9 @@ int Run(HINSTANCE instance, const std::wstring& cmdLine) {
     //  composited by the desktop window manager in a pass of its own,
     //  after the ordinary windows, so it would float above every
     //  application whatever the z order says.  This one obeys the z
-    //  order, which is what lets it rest on the desktop.  While it
-    //  rests there it also lets the clicks through.
-    DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT;
+    //  order, which is what lets it rest on the desktop.  It is not
+    //  click through, because it has to be possible to drag it.
+    DWORD exStyle = WS_EX_TOOLWINDOW;
 
     st.hwnd = CreateWindowExW(exStyle, wc.lpszClassName, L"JARVIS Search", WS_POPUP, 0, 0,
                               (int)st.cfg.barWidth, (int)st.cfg.barHeight, nullptr, nullptr,

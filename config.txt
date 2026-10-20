@@ -45,6 +45,11 @@ position=top-right
 # corner of the work area.  -1 means "use the corner named by
 # position above".
 #
+# The bar can be dragged with the left mouse button, and wherever it
+# is put is written back into this file, so it comes back in the same
+# place the next time the machine starts.  The two values below are
+# the place it was last dragged to.
+#
 # 624, 94 puts the bar under the row of desktop icons (the first
 # icon column starts at 624) and to the right of the greeting card.
 pos_x=624

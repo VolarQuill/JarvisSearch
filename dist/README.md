@@ -90,6 +90,13 @@ when it loses the focus it goes back down to the desktop, and the hotkey puts
 it away as well. Clicking an entry does the same as `Enter`. The bar also has
 a notification area icon: left click focuses it, right click opens the menu.
 
+The bar can be moved with the left mouse button: hold it down on the bar and
+drag it somewhere else. Wherever you let go of it, that place is written into
+`config.txt` as `pos_x` and `pos_y`, so the bar is in the same place the next
+time the machine starts. A click without a movement brings the bar up instead
+of moving it, and the bar never takes the focus away from the program you are
+typing in while you drag it.
+
 ## Configuration
 
 `config.txt` sits next to the executable and is read on every launch. Every
@@ -102,6 +109,8 @@ setting has a built in default, so the file is optional.
 | `label_font_size` | `10` | size of the labels and the status line |
 | `status_text` | `SYSTEM ONLINE` | text in the status line |
 | `position` | `top-center` | `top/center/bottom` combined with `-left/-center/-right` |
+| `pos_x` | `-1` | exact place of the bar, in logical pixels from the left edge of the work area; `-1` means use `position` |
+| `pos_y` | `-1` | exact place of the bar, in logical pixels from the top edge of the work area; `-1` means use `position` |
 | `margin` | `24` | distance from the edge of the work area |
 | `bar_width` | `680` | width of the bar |
 | `bar_height` | `48` | height of the bar |
@@ -139,6 +148,11 @@ tools/acceptance.ps1 the test that drives the real program
   the window, so nothing of the desktop shows through it. While it rests its
   contents are mixed a little towards the colour of the card
   (`idle_brightness`), which is what gives it the soft look.
+* **It can be moved.** The bar is taken hold of with the left mouse button and
+  dragged somewhere else. The place is written into `config.txt` as `pos_x` and
+  `pos_y`, so the bar comes back in the same place the next time the machine
+  starts, and the drag never takes the focus away from the program you are
+  typing in.
 * **The text input is hand written.** The query field is not a control: the
   characters come in through `WM_CHAR` and are kept in a string.
 * **The applications come out of the shell.** The Start menu is walked for

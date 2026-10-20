@@ -222,8 +222,10 @@ if ($ex -band [JS]::WS_EX_TOPMOST) {
 }
 if ($ex -band [JS]::WS_EX_TOOLWINDOW)  { Ok 'the bar is a tool window' }
 else                                   { Bad 'the bar is a tool window' }
-if ($ex -band [JS]::WS_EX_TRANSPARENT) { Ok 'the resting bar lets the clicks through' }
-else                                   { Bad 'the resting bar lets the clicks through' }
+#  The bar is not click through: it has to be possible to take hold of
+#  it with the left mouse button and move it somewhere else.
+if ($ex -band [JS]::WS_EX_TRANSPARENT) { Bad 'the resting bar can be grabbed' }
+else                                   { Ok 'the resting bar can be grabbed' }
 
 #  The bar has to sit on the desktop, so the shell's desktop window
 #  has to be below it.
@@ -423,8 +425,8 @@ Start-Sleep -Milliseconds 800
 $ex = Ex-Style $hwnd
 if ($ex -band [JS]::WS_EX_TOPMOST) { Bad 'the bar goes back to the desktop' 'it is still on top' }
 else { Ok 'the bar goes back to the desktop' }
-if ($ex -band [JS]::WS_EX_TRANSPARENT) { Ok 'the resting bar lets the clicks through again' }
-else { Bad 'the resting bar lets the clicks through again' }
+if ($ex -band [JS]::WS_EX_TRANSPARENT) { Bad 'the resting bar can be grabbed again' }
+else { Ok 'the resting bar can be grabbed again' }
 
 $below = [JS]::GetWindow($hwnd, [JS]::GW_HWNDNEXT)
 if (In-Desktop-Band $hwnd $progman) {
