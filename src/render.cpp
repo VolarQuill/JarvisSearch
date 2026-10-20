@@ -302,6 +302,10 @@ Renderer::~Renderer() {
     m_fontLabel.reset();
     m_fontSmall.reset();
     m_family.reset();
+    if (m_screenDc) {
+        ReleaseDC(nullptr, m_screenDc);
+        m_screenDc = nullptr;
+    }
 }
 
 bool Renderer::Init(const Config& cfg, HWND hwnd) {
@@ -331,6 +335,7 @@ bool Renderer::Init(const Config& cfg, HWND hwnd) {
     if (!ResolveFont()) return false;
     if (!PrepareFonts()) return false;
     ProbeGdiAlpha();
+    BuildComposeTables();
     return true;
 }
 
@@ -456,6 +461,8 @@ Layout Renderer::ComputeLayout(const UiModel& m) const {
 //  Drawing
 //======================================================================
 void Renderer::DrawScene(Gdiplus::Graphics& g, const UiModel& m, const Layout& lay) {
+    m_iconDraws.clear();
+
     DrawFrame(g, m, lay);
     DrawBar(g, m, lay);
     if (!m.panelOpen) return;
@@ -473,6 +480,29 @@ void Renderer::DrawScene(Gdiplus::Graphics& g, const UiModel& m, const Layout& l
                Gdiplus::RectF((float)(lay.statusLine.x + 10), (float)lay.statusLine.y,
                               (float)(lay.statusLine.w - 20), (float)lay.statusLine.h),
                m_fontSmall.get(), ColScaled(kTextDim, 150), m_advanceSmall, 0.8f * m_scale);
+
+    //  The icons are drawn last, in one go, so that the handover from
+    //  GDI+ to GDI happens once for the frame instead of once per row.
+    FlushIcons(g);
+}
+
+//  Draws the collected row icons with a single device context.
+//
+//  Every GetHDC is a handover from GDI+ to GDI, and it flushes the
+//  pipeline both ways.  Doing it once per row cost more than the icons
+//  themselves, so the rows only record where their icon goes and the
+//  whole set is drawn here.
+void Renderer::FlushIcons(Gdiplus::Graphics& g) {
+    if (m_iconDraws.empty()) return;
+    HDC hdc = g.GetHDC();
+    if (hdc) {
+        for (const IconDraw& d : m_iconDraws) {
+            if (!d.icon) continue;
+            DrawIconEx(hdc, d.x, d.y, d.icon, d.size, d.size, 0, nullptr, DI_NORMAL);
+        }
+        g.ReleaseHDC(hdc);
+    }
+    m_iconDraws.clear();
 }
 
 void Renderer::DrawBracket(Gdiplus::Graphics& g, const RectI& r, const Gdiplus::Color& color) {
@@ -688,14 +718,18 @@ void Renderer::DrawRow(Gdiplus::Graphics& g, const UiModel& m, const Layout& lay
     }
 
     float textX = (float)rect.x + 2.0f * s;
-    if (row.icon) {
+    if (row.iconSlot) {
         const float is = kRowIconSize * s;
         const float iy = (float)rect.y + (rowH - is) * 0.5f;
-        HDC hdc = g.GetHDC();
-        if (hdc) {
-            DrawIconEx(hdc, (int)((float)rect.x + 2.0f * s), (int)iy, row.icon,
-                       (int)is, (int)is, 0, nullptr, DI_NORMAL);
-            g.ReleaseHDC(hdc);
+        if (row.icon) {
+            //  Only note where the icon goes; the frame draws them all
+            //  at once, when it has a device context of its own.
+            IconDraw d;
+            d.icon = row.icon;
+            d.x = (int)((float)rect.x + 2.0f * s);
+            d.y = (int)iy;
+            d.size = (int)is;
+            m_iconDraws.push_back(d);
         }
         textX = (float)rect.x + is + kIconGap * s + 2.0f * s;
     }
@@ -830,6 +864,36 @@ bool Renderer::ProbeGdiAlpha() {
     return true;
 }
 
+void Renderer::BuildComposeTables() {
+    //  What the card shows through an alpha.  In the premultiplied
+    //  case that is the share of the card colour that the pixel does
+    //  not cover; in the straight case it is the part of the card
+    //  colour that is mixed in, before the division.
+    const int cr = kPanelFill.r, cg = kPanelFill.g, cb = kPanelFill.b;
+    for (int a = 0; a < 256; ++a) {
+        const int inv = 255 - a;
+        if (m_gdiPremultiplies) {
+            m_cardB[a] = (WORD)((cb * inv + 127) / 255);
+            m_cardG[a] = (WORD)((cg * inv + 127) / 255);
+            m_cardR[a] = (WORD)((cr * inv + 127) / 255);
+        } else {
+            m_cardB[a] = (WORD)(cb * inv);
+            m_cardG[a] = (WORD)(cg * inv);
+            m_cardR[a] = (WORD)(cr * inv);
+        }
+    }
+
+    //  The straight case needs the division by 255 as well.  The sum
+    //  that is divided never passes 65025, so the table covers it.
+    if (!m_gdiPremultiplies) {
+        if (m_div255.size() != 65536) m_div255.resize(65536);
+        for (int t = 0; t < 65536; ++t) m_div255[(size_t)t] = (BYTE)((t + 127) / 255);
+    } else {
+        m_div255.clear();
+        m_div255.shrink_to_fit();
+    }
+}
+
 void Renderer::ComposeOpaque(Gdiplus::Bitmap& src, BYTE* dst, int dstStride, int fade) {
     const int w = (int)src.GetWidth();
     const int h = (int)src.GetHeight();
@@ -851,40 +915,58 @@ void Renderer::ComposeOpaque(Gdiplus::Bitmap& src, BYTE* dst, int dstStride, int
     if (f > 255) f = 255;
     const int finv = 255 - f;
 
-    for (int y = 0; y < h; ++y) {
-        const BYTE* s = (const BYTE*)bd.Scan0 + (size_t)y * bd.Stride;
-        BYTE* d = dst + (size_t)y * dstStride;
-        for (int x = 0; x < w; ++x) {
-            const int a = s[3];
-            const int inv = 255 - a;
-            //  A 32 bit ARGB surface stores the samples as B, G, R, A.
-            int r, g, b;
-            if (m_gdiPremultiplies) {
+    //  The fade tables are short and are rebuilt for the frame.  The
+    //  fade mixes the finished pixel back towards the card, which is
+    //  how the resting bar looks softer than the one being used.
+    for (int v = 0; v < 256; ++v) {
+        m_fadeB[v] = (BYTE)((v * f + cb * finv + 127) / 255);
+        m_fadeG[v] = (BYTE)((v * f + cg * finv + 127) / 255);
+        m_fadeR[v] = (BYTE)((v * f + cr * finv + 127) / 255);
+    }
+
+    const WORD* cardB = m_cardB;
+    const WORD* cardG = m_cardG;
+    const WORD* cardR = m_cardR;
+    const BYTE* fadeB = m_fadeB;
+    const BYTE* fadeG = m_fadeG;
+    const BYTE* fadeR = m_fadeR;
+
+    if (m_gdiPremultiplies) {
+        for (int y = 0; y < h; ++y) {
+            const BYTE* s = (const BYTE*)bd.Scan0 + (size_t)y * bd.Stride;
+            BYTE* d = dst + (size_t)y * dstStride;
+            for (int x = 0; x < w; ++x) {
+                const int a = s[3];
                 //  The colour already carries the alpha, so only the
                 //  part of the card that shows through is added.
-                b = s[0] + (cb * inv + 127) / 255;
-                g = s[1] + (cg * inv + 127) / 255;
-                r = s[2] + (cr * inv + 127) / 255;
-            } else {
-                b = (s[0] * a + cb * inv + 127) / 255;
-                g = (s[1] * a + cg * inv + 127) / 255;
-                r = (s[2] * a + cr * inv + 127) / 255;
+                int ib = s[0] + cardB[a];
+                int ig = s[1] + cardG[a];
+                int ir = s[2] + cardR[a];
+                if (ib > 255) ib = 255;
+                if (ig > 255) ig = 255;
+                if (ir > 255) ir = 255;
+                d[0] = fadeB[ib];
+                d[1] = fadeG[ig];
+                d[2] = fadeR[ir];
+                d[3] = 255;
+                s += 4;
+                d += 4;
             }
-            //  The fade mixes the finished pixel back towards the
-            //  card, which is how the resting bar looks softer than
-            //  the one that is being used.
-            r = (r * f + cr * finv + 127) / 255;
-            g = (g * f + cg * finv + 127) / 255;
-            b = (b * f + cb * finv + 127) / 255;
-            if (r > 255) r = 255;
-            if (g > 255) g = 255;
-            if (b > 255) b = 255;
-            d[0] = (BYTE)b;
-            d[1] = (BYTE)g;
-            d[2] = (BYTE)r;
-            d[3] = 255;
-            s += 4;
-            d += 4;
+        }
+    } else {
+        const BYTE* div = m_div255.data();
+        for (int y = 0; y < h; ++y) {
+            const BYTE* s = (const BYTE*)bd.Scan0 + (size_t)y * bd.Stride;
+            BYTE* d = dst + (size_t)y * dstStride;
+            for (int x = 0; x < w; ++x) {
+                const int a = s[3];
+                d[0] = fadeB[div[s[0] * a + cardB[a]]];
+                d[1] = fadeG[div[s[1] * a + cardG[a]]];
+                d[2] = fadeR[div[s[2] * a + cardR[a]]];
+                d[3] = 255;
+                s += 4;
+                d += 4;
+            }
         }
     }
     src.UnlockBits(&bd);
@@ -893,15 +975,33 @@ void Renderer::ComposeOpaque(Gdiplus::Bitmap& src, BYTE* dst, int dstStride, int
 bool Renderer::Present(HWND hwnd, const UiModel& model, const Layout& layout, int fade) {
     if (!hwnd || layout.width <= 0 || layout.height <= 0) return false;
 
-    Gdiplus::Bitmap frame((INT)layout.width, (INT)layout.height, PixelFormat32bppARGB);
-    if (frame.GetLastStatus() != Gdiplus::Ok) return false;
+    //  The frame, the surface and the window region only change when
+    //  the bar changes size, which is when the results panel opens and
+    //  closes.  They are kept between frames: a fresh two megabyte
+    //  bitmap, a fresh device context and a fresh window region on
+    //  every keystroke is a lot of work for nothing, and the bar is
+    //  redrawn for every letter that is typed.
+    const bool sizeChanged = (layout.width != m_lastWidth || layout.height != m_lastHeight);
+    if (sizeChanged) {
+        m_frame.reset(new Gdiplus::Bitmap((INT)layout.width, (INT)layout.height,
+                                           PixelFormat32bppARGB));
+        if (!m_frame || m_frame->GetLastStatus() != Gdiplus::Ok) {
+            m_frame.reset();
+            return false;
+        }
+    }
+    if (!m_frame) return false;
 
     {
-        Gdiplus::Graphics g(&frame);
+        Gdiplus::Graphics g(m_frame.get());
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-        g.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+        //  The high quality compositing costs about twenty five
+        //  milliseconds a frame on the panel, which is more than
+        //  everything else in the frame put together, and the panel is
+        //  opaque: there is nothing for it to composite carefully.
+        g.SetCompositingQuality(Gdiplus::CompositingQualityHighSpeed);
         g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
 
         DrawScene(g, model, layout);
@@ -910,17 +1010,22 @@ bool Renderer::Present(HWND hwnd, const UiModel& model, const Layout& layout, in
 
     //  The frame is flattened onto the window surface, so the panel is
     //  a solid card and only its contents are softened by the fade.
-    HDC screen = GetDC(nullptr);
-    if (!screen) return false;
-    if (!m_surface.Create(screen, layout.width, layout.height)) {
-        ReleaseDC(nullptr, screen);
-        return false;
+    if (!m_screenDc) m_screenDc = GetDC(nullptr);
+    if (!m_screenDc) return false;
+    if (sizeChanged || m_surface.w != layout.width || m_surface.h != layout.height) {
+        if (!m_surface.Create(m_screenDc, layout.width, layout.height)) return false;
     }
-    ComposeOpaque(frame, m_surface.bits, layout.width * 4, fade);
-    ReleaseDC(nullptr, screen);
+    ComposeOpaque(*m_frame, m_surface.bits, layout.width * 4, fade);
 
-    ApplyRegion(hwnd, layout);
+    //  The region is the shape of the card, so it only changes with
+    //  the size of the bar.
+    if (sizeChanged) ApplyRegion(hwnd, layout);
     InvalidateRect(hwnd, nullptr, FALSE);
+    //  The frame has to go on the screen now.  The system only sends
+    //  WM_PAINT when there is nothing else in the message queue, so
+    //  without this a letter typed while the bar was busy would wait
+    //  for the typing to stop before it appeared.
+    UpdateWindow(hwnd);
 
     m_lastWidth = layout.width;
     m_lastHeight = layout.height;

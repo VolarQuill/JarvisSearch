@@ -35,6 +35,10 @@ struct UiRow {
     std::wstring label;
     std::wstring sublabel;
     HICON        icon = nullptr;   //  borrowed, never owned by the renderer
+    //  True when the row has an icon whether or not it has arrived
+    //  yet.  The room is kept either way, so that the text does not
+    //  jump about while the icons are coming in.
+    bool         iconSlot = false;
     int          highlight[64] = {0};
     int          highlightCount = 0;
 };
@@ -161,10 +165,26 @@ public:
     int  LastHeight() const { return m_lastHeight; }
 
 private:
+    //  A row icon that is waiting to be drawn.
+    //
+    //  The icons are drawn with GDI, and GDI and GDI+ cannot draw into
+    //  the same device context at the same time.  So the rows only
+    //  record where their icon goes, and the whole set is drawn at the
+    //  end of the frame with a single pair of GetHDC and ReleaseHDC.
+    //  Doing it per row costs a pipeline flush per row.
+    struct IconDraw {
+        HICON icon = nullptr;
+        int   x = 0, y = 0, size = 0;
+    };
+
     //  Draws the complete scene: frame, bar, both panes and the
     //  status line.  The live path and the PNG dump share it so that
     //  the screenshot can never drift away from the screen.
     void DrawScene(Gdiplus::Graphics& g, const UiModel& m, const Layout& lay);
+
+    //  Draws the row icons that the rows collected, with one device
+    //  context for the whole frame.
+    void FlushIcons(Gdiplus::Graphics& g);
 
     //  Drawing helpers
     void DrawFrame(Gdiplus::Graphics& g, const UiModel& m, const Layout& lay);
@@ -191,6 +211,7 @@ private:
     //  is probed once at start-up.
     void ComposeOpaque(Gdiplus::Bitmap& src, BYTE* dst, int dstStride, int fade);
     bool ProbeGdiAlpha();
+    void BuildComposeTables();
 
     //  Type
     bool ResolveFont();
@@ -215,6 +236,34 @@ private:
     int                       m_lastWidth = 0;
     int                       m_lastHeight = 0;
     DibSurface                m_surface;
+    //  The frame is composed on a surface of its own, so that it can
+    //  be flattened onto the opaque one.  It only changes when the bar
+    //  changes size, which is when the panel opens and closes, so it
+    //  is kept between frames instead of being allocated anew for
+    //  every keystroke.
+    std::unique_ptr<Gdiplus::Bitmap> m_frame;
+    //  The screen device context, kept for the same reason.
+    HDC                       m_screenDc = nullptr;
+    //  The row icons waiting to be drawn.
+    std::vector<IconDraw>     m_iconDraws;
+
+    //  Tables for the flattening.
+    //
+    //  Flattening a pixel is the same arithmetic every time, so the
+    //  answers are looked up rather than divided out: six divisions a
+    //  pixel become six table reads.
+    //
+    //  m_card* holds what the card shows through a given alpha, and
+    //  m_fade* holds the fade for a given value.  m_div255 holds the
+    //  division by 255 and is only needed when GDI+ hands out straight
+    //  alpha, where the colour has to be scaled as well.
+    WORD m_cardB[256] = {0};
+    WORD m_cardG[256] = {0};
+    WORD m_cardR[256] = {0};
+    BYTE m_fadeB[256] = {0};
+    BYTE m_fadeG[256] = {0};
+    BYTE m_fadeR[256] = {0};
+    std::vector<BYTE> m_div255;
 };
 
 }  // namespace js

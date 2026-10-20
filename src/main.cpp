@@ -24,11 +24,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <deque>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -41,6 +45,8 @@ using namespace js;
 constexpr UINT       kTrayMessage  = WM_APP + 1;
 //  Posted by the scan thread when the application list is complete.
 constexpr UINT       kScanDoneMsg  = WM_APP + 2;
+//  Posted by the icon thread when there is nothing left to fetch.
+constexpr UINT       kIconReadyMsg = WM_APP + 3;
 constexpr int        kHotkeyId     = 0xB01;
 constexpr int        kTimerCaret   = 1;
 constexpr int        kTimerClock   = 2;
@@ -86,6 +92,20 @@ struct AppState {
 
     std::unordered_map<std::wstring, HICON> iconCache;
 
+    //  The icons are fetched on a worker thread.
+    //
+    //  Pulling an icon out of a file costs ten to twenty milliseconds,
+    //  and doing that on the thread that draws the bar is what made the
+    //  letters appear only when the typing stopped.  The rows ask for
+    //  the icon they want, and they are drawn without one until the
+    //  worker has it.
+    std::mutex                iconMutex;
+    std::deque<AppEntry>      iconQueue;    //  asked for by a visible row
+    std::deque<AppEntry>      iconWarm;     //  asked for in advance
+    std::unordered_set<std::wstring> iconPending;
+    std::thread               iconThread;
+    std::atomic<bool>         iconStop{false};
+
     std::thread        scanThread;
     std::atomic<bool>  scanDone{false};
 
@@ -93,6 +113,9 @@ struct AppState {
     bool  trayAdded = false;
 
     std::wstring logPath;
+    //  The log file is opened once and kept open: opening and closing
+    //  it for every line cost a noticeable share of a keystroke.
+    HANDLE      logHandle = INVALID_HANDLE_VALUE;
     std::wstring dumpPath;
     bool  selftest = false;
     bool  listApps = false;
@@ -113,16 +136,21 @@ UINT g_showMessage = 0;
 //----------------------------------------------------------------------
 //  Small helpers
 //----------------------------------------------------------------------
-void LogLine(const AppState& st, const std::string& line) {
+void LogLine(AppState& st, const std::string& line) {
     if (st.logPath.empty()) return;
-    HANDLE fh = CreateFileW(st.logPath.c_str(), FILE_APPEND_DATA,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
-                            FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (fh == INVALID_HANDLE_VALUE) return;
+    if (st.logHandle == INVALID_HANDLE_VALUE) {
+        st.logHandle = CreateFileW(st.logPath.c_str(), FILE_APPEND_DATA,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (st.logHandle == INVALID_HANDLE_VALUE) return;
+    }
     std::string blob = line + "\r\n";
     DWORD written = 0;
-    WriteFile(fh, blob.data(), (DWORD)blob.size(), &written, nullptr);
-    CloseHandle(fh);
+    WriteFile(st.logHandle, blob.data(), (DWORD)blob.size(), &written, nullptr);
+    //  The file is kept open, so the end of it has to be pushed out
+    //  for anything else that reads the log to see the line.  Without
+    //  this the log stays empty until the program closes.
+    FlushFileBuffers(st.logHandle);
 }
 
 
@@ -306,21 +334,97 @@ void RebuildResults(AppState& st) {
     if (st.webSelected < 0) st.webSelected = 0;
 }
 
-HICON IconFor(AppState& st, const Result& r) {
+//----------------------------------------------------------------------
+//  Icons
+//
+//  An icon is pulled out of a file, and that costs ten to twenty
+//  milliseconds.  Doing it while the bar was being drawn held the
+//  keyboard back, and the letters only appeared once the typing
+//  stopped.  So the icons are fetched by a worker thread and the row
+//  is drawn without one until it is ready.
+//----------------------------------------------------------------------
+
+//  What an application is known by.  The same key means the same icon.
+std::wstring IconKey(const AppEntry& app) {
+    if (!app.target.empty()) return app.target;
+    if (!app.aumid.empty()) return app.aumid;
+    return app.name;
+}
+
+//  Asks for the icon of an application, and gives it back if it is
+//  already in the cache.  A missing icon is asked for and not waited
+//  for.
+//
+//  The caller holds the lock on the cache, so that a whole pane of rows
+//  costs one turn of it and not one per row.
+HICON IconFor(AppState& st, const Result& r, const std::vector<AppEntry>& all) {
     if (r.kind != ResultKind::App) return nullptr;
-    const std::vector<AppEntry>& all = st.index.All();
     if (r.index < 0 || r.index >= (int)all.size()) return nullptr;
     const AppEntry& app = all[(size_t)r.index];
 
-    std::wstring key = app.target;
-    if (key.empty()) key = app.aumid;
-    if (key.empty()) key = app.name;
+    const std::wstring key = IconKey(app);
     auto it = st.iconCache.find(key);
     if (it != st.iconCache.end()) return it->second;
+    if (st.iconPending.insert(key).second) st.iconQueue.push_back(app);
+    return nullptr;
+}
 
-    HICON icon = ExtractAppIcon(app);
-    st.iconCache[key] = icon;
-    return icon;
+//  Asks for an icon that nobody is waiting for.  The applications that
+//  are used most often are fetched as soon as the list is complete, so
+//  that the first letter typed already has its icons.
+void WarmIcon(AppState& st, const AppEntry& app) {
+    const std::wstring key = IconKey(app);
+    std::lock_guard<std::mutex> lk(st.iconMutex);
+    if (st.iconCache.count(key)) return;
+    if (!st.iconPending.insert(key).second) return;
+    st.iconWarm.push_back(app);
+}
+
+//  The worker.  It takes the icons that a visible row asked for first,
+//  and the ones that were warmed in the background afterwards.
+void IconWorker(AppState& st) {
+    while (!st.iconStop.load(std::memory_order_acquire)) {
+        AppEntry app;
+        bool urgent = false;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lk(st.iconMutex);
+            if (!st.iconQueue.empty()) {
+                app = st.iconQueue.front();
+                st.iconQueue.pop_front();
+                urgent = true;
+                have = true;
+            } else if (!st.iconWarm.empty()) {
+                app = st.iconWarm.front();
+                st.iconWarm.pop_front();
+                have = true;
+            }
+        }
+        //  Nothing to do.  The wait is outside the lock: sleeping with
+        //  the lock held would hold up every row that asks for an icon.
+        if (!have) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
+
+        HICON icon = ExtractAppIcon(app);
+        const std::wstring key = IconKey(app);
+        bool everythingDone = false;
+        {
+            std::lock_guard<std::mutex> lk(st.iconMutex);
+            //  A missing icon is remembered as well, so that it is not
+            //  asked for again on every keystroke.
+            st.iconCache[key] = icon;
+            st.iconPending.erase(key);
+            everythingDone = st.iconQueue.empty() && st.iconWarm.empty();
+        }
+
+        //  The window is told when there is nothing left to fetch, so
+        //  that the rows are drawn once with every icon they can get
+        //  instead of once per icon.
+        if ((urgent || everythingDone) && st.hwnd)
+            PostMessageW(st.hwnd, kIconReadyMsg, 0, 0);
+    }
 }
 
 void SyncModel(AppState& st) {
@@ -337,17 +441,28 @@ void SyncModel(AppState& st) {
     if (!st.cfg.statusText.empty())
         st.model.hint = st.cfg.statusText + L"     " + st.model.hint;
 
+    //  A copy of the list, because the scan may still be running on
+    //  its own thread while the pane is being drawn.
+    const std::vector<AppEntry> all = st.index.Snapshot();
+
     st.model.apps.rows.clear();
     st.model.apps.title = L"APPLICATIONS";
-    for (const Result& r : st.appResults) {
-        UiRow row;
-        row.label = r.label;
-        row.sublabel = r.sublabel;
-        row.highlightCount = std::min(r.highlightCount, 64);
-        if (row.highlightCount > 0)
-            memcpy(row.highlight, r.highlight, sizeof(int) * (size_t)row.highlightCount);
-        row.icon = IconFor(st, r);
-        st.model.apps.rows.push_back(row);
+    {
+        std::lock_guard<std::mutex> lk(st.iconMutex);
+        for (const Result& r : st.appResults) {
+            UiRow row;
+            row.label = r.label;
+            row.sublabel = r.sublabel;
+            row.highlightCount = std::min(r.highlightCount, 64);
+            if (row.highlightCount > 0)
+                memcpy(row.highlight, r.highlight, sizeof(int) * (size_t)row.highlightCount);
+            row.icon = IconFor(st, r, all);
+            //  The room for the icon is kept even when the icon has not
+            //  arrived yet, so that the text does not jump about while
+            //  the icons are coming in.
+            row.iconSlot = (r.kind == ResultKind::App);
+            st.model.apps.rows.push_back(row);
+        }
     }
     st.model.apps.selected = st.appSelected;
     st.model.apps.scroll = 0;
@@ -1051,6 +1166,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Redraw(*st);
             return 0;
 
+        case kIconReadyMsg:
+            //  The icons that were asked for have arrived, so the rows
+            //  are drawn again with them.
+            if (st->summoned) Redraw(*st);
+            return 0;
+
         case kTrayMessage: {
             if (lp == WM_LBUTTONUP || lp == WM_LBUTTONDBLCLK) {
                 Summon(*st);
@@ -1307,11 +1428,30 @@ int Run(HINSTANCE instance, const std::wstring& cmdLine) {
 
     if (st.cfg.showTray) AddTrayIcon(st);
 
+    //  The icons are fetched on their own thread, so that a row never
+    //  waits for one while the keyboard does.
+    st.iconThread = std::thread([&st]() { IconWorker(st); });
+
     //  The application list is built on a worker thread so that the bar
     //  is on screen immediately.
     st.scanThread = std::thread([&st]() {
         st.index.Scan(st.cfg.loadUwp);
         st.scanDone.store(true, std::memory_order_release);
+        //  The icons of the applications that are used most often are
+        //  fetched in advance, so that the first letter typed already
+        //  has them.
+        {
+            const std::vector<AppEntry> all = st.index.Snapshot();
+            std::vector<int> order(all.size());
+            for (size_t i = 0; i < all.size(); ++i) order[i] = (int)i;
+            std::sort(order.begin(), order.end(), [&all](int x, int y) {
+                if (all[(size_t)x].uses != all[(size_t)y].uses)
+                    return all[(size_t)x].uses > all[(size_t)y].uses;
+                return LowerAscii(all[(size_t)x].name) < LowerAscii(all[(size_t)y].name);
+            });
+            const int n = std::min<int>((int)order.size(), 12);
+            for (int i = 0; i < n; ++i) WarmIcon(st, all[(size_t)order[(size_t)i]]);
+        }
         //  Tell the window, so that a query typed before the scan
         //  finished is run again against the full list.
         PostMessageW(st.hwnd, kScanDoneMsg, 0, 0);
@@ -1343,6 +1483,12 @@ int Run(HINSTANCE instance, const std::wstring& cmdLine) {
     }
 
     if (st.scanThread.joinable()) st.scanThread.join();
+    st.iconStop.store(true, std::memory_order_release);
+    if (st.iconThread.joinable()) st.iconThread.join();
+    if (st.logHandle != INVALID_HANDLE_VALUE) {
+        CloseHandle(st.logHandle);
+        st.logHandle = INVALID_HANDLE_VALUE;
+    }
     if (single) { ReleaseMutex(single); CloseHandle(single); }
     UnregisterHotKey(st.hwnd, kHotkeyId);
     g_app = nullptr;
