@@ -1,0 +1,24 @@
+# build output
+JarvisSearch.exe
+*.o
+*.obj
+
+# the self-contained binary that ships with the repository, so that the
+# program can be installed on a machine with no compiler
+!dist/JarvisSearch.exe
+
+# frames the self test writes next to the executable
+JarvisSearch_frame*.png
+
+# runtime diagnostics
+apps.txt
+query.txt
+*.log
+
+# build output of the little probe programs under tools/
+tools/*.exe
+tools/*.bmp
+tools/probe_*.png
+
+# backups written by install.ps1 when it preserves an edited data file
+*.bak

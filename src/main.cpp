@@ -1,0 +1,1160 @@
+//======================================================================
+//  JARVIS SEARCH  -  the controller.
+//
+//  A single borderless, per-pixel transparent window that lives on the
+//  desktop.  It is invisible to the taskbar and to Alt+Tab, it never
+//  steals the focus when it starts, and it only opens its results panel
+//  when it has the focus.
+//
+//  The left pane lists the applications that are installed on the
+//  machine, the right pane lists the web search providers.  Clicking an
+//  entry launches the application or opens the search in the browser.
+//
+//  Build (MSYS2 UCRT64):
+//    g++ -std=c++17 -O2 -municode -mwindows -o JarvisSearch.exe 
+//        src/*.cpp -lgdiplus -luser32 -lgdi32 -lole32 -luuid -lshell32 
+//        -ladvapi32 -static
+//======================================================================
+
+#include "jarvis.h"
+#include "render.h"
+
+#include <shellapi.h>
+#include <windowsx.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+namespace {
+
+using namespace js;
+
+//----------------------------------------------------------------------
+//  Constants
+//----------------------------------------------------------------------
+constexpr UINT       kTrayMessage  = WM_APP + 1;
+//  Posted by the scan thread when the application list is complete.
+constexpr UINT       kScanDoneMsg  = WM_APP + 2;
+constexpr int        kHotkeyId     = 0xB01;
+constexpr int        kTimerCaret   = 1;
+constexpr int        kTimerClock   = 2;
+constexpr int        kTraySearchId = 100;
+constexpr int        kTrayAutoId   = 101;
+constexpr int        kTrayQuitId   = 102;
+constexpr const wchar_t* kRunKeyPath = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr const wchar_t* kRunValueName = L"JarvisSearch";
+constexpr const wchar_t* kMutexName = L"Local\\JarvisSearchBar";
+
+struct AppState {
+    Config   cfg;
+    Renderer renderer;
+    AppIndex index;
+    std::vector<Provider> providers;
+    UiModel  model;
+
+    HWND      hwnd = nullptr;
+    HINSTANCE inst = nullptr;
+
+    std::wstring query;
+    int         caret = 0;
+
+    bool focused = false;
+    bool caretOn = true;
+    int  activePane = 0;
+    int  appSelected = 0;
+    int  webSelected = 0;
+
+    std::vector<Result> appResults;
+    std::vector<Result> webResults;
+
+    std::unordered_map<std::wstring, HICON> iconCache;
+
+    std::thread        scanThread;
+    std::atomic<bool>  scanDone{false};
+
+    NOTIFYICONDATAW nid{};
+    bool  trayAdded = false;
+
+    std::wstring logPath;
+    std::wstring dumpPath;
+    bool  selftest = false;
+    bool  listApps = false;
+    std::wstring queryArg;
+    bool  showPanel = true;
+};
+
+AppState* g_app = nullptr;
+
+//  The message that a second copy of the bar uses to ask the first
+//  one to show itself.
+UINT g_showMessage = 0;
+
+//----------------------------------------------------------------------
+//  Small helpers
+//----------------------------------------------------------------------
+void LogLine(const AppState& st, const std::string& line) {
+    if (st.logPath.empty()) return;
+    HANDLE fh = CreateFileW(st.logPath.c_str(), FILE_APPEND_DATA,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (fh == INVALID_HANDLE_VALUE) return;
+    std::string blob = line + "\r\n";
+    DWORD written = 0;
+    WriteFile(fh, blob.data(), (DWORD)blob.size(), &written, nullptr);
+    CloseHandle(fh);
+}
+
+std::wstring SubLabelFor(const AppEntry& app) {
+    switch (app.kind) {
+        case AppKind::Uwp:        return L"STORE";
+        case AppKind::Executable: return L"PROGRAM";
+        case AppKind::Shortcut:
+        default:                  return L"START MENU";
+    }
+}
+
+std::wstring ClockText() {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t buf[16];
+    swprintf(buf, sizeof(buf) / sizeof(buf[0]), L"%02d:%02d", st.wHour, st.wMinute);
+    return buf;
+}
+
+//----------------------------------------------------------------------
+//  Autostart
+//----------------------------------------------------------------------
+bool IsAutostartEnabled() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return false;
+    wchar_t buf[2048];
+    DWORD sz = sizeof(buf), type = 0;
+    bool found = false;
+    if (RegQueryValueExW(key, kRunValueName, nullptr, &type, (LPBYTE)buf, &sz) == ERROR_SUCCESS)
+        found = (type == REG_SZ || type == REG_EXPAND_SZ);
+    RegCloseKey(key);
+    return found;
+}
+
+bool SetAutostartEnabled(bool enabled) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, nullptr, REG_OPTION_NON_VOLATILE,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return false;
+    bool ok = true;
+    if (enabled) {
+        wchar_t path[32768];
+        const DWORD n = GetModuleFileNameW(nullptr, path, 32768);
+        if (n == 0) {
+            ok = false;
+        } else {
+            std::wstring cmd = L"\"";
+            cmd.append(path, n);
+            cmd += L"\"";
+            ok = (RegSetValueExW(key, kRunValueName, 0, REG_SZ, (const BYTE*)cmd.c_str(),
+                                 (DWORD)((cmd.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS);
+        }
+    } else {
+        const LONG rc = RegDeleteValueW(key, kRunValueName);
+        ok = (rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND);
+    }
+    RegCloseKey(key);
+    return ok;
+}
+
+//----------------------------------------------------------------------
+//  Global hotkey
+//----------------------------------------------------------------------
+UINT ParseHotkey(const std::wstring& spec) {
+    if (spec.empty()) return 0;
+
+    std::vector<std::wstring> parts;
+    std::wstring cur;
+    for (wchar_t c : spec) {
+        if (c == L'+') {
+            if (!cur.empty()) parts.push_back(cur);
+            cur.clear();
+        } else {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty()) parts.push_back(cur);
+    if (parts.empty()) return 0;
+
+    UINT mods = 0;
+    UINT vk = 0;
+    for (const std::wstring& raw : parts) {
+        const std::wstring p = LowerAscii(raw);
+        if (p == L"ctrl" || p == L"control") { mods |= MOD_CONTROL; continue; }
+        if (p == L"alt")  { mods |= MOD_ALT; continue; }
+        if (p == L"shift") { mods |= MOD_SHIFT; continue; }
+        if (p == L"win" || p == L"super" || p == L"cmd") { mods |= MOD_WIN; continue; }
+
+        if (p == L"space") { vk = VK_SPACE; continue; }
+        if (p == L"enter" || p == L"return") { vk = VK_RETURN; continue; }
+        if (p == L"esc" || p == L"escape") { vk = VK_ESCAPE; continue; }
+        if (p == L"tab") { vk = VK_TAB; continue; }
+        if (p == L"backspace") { vk = VK_BACK; continue; }
+        if (p == L"home") { vk = VK_HOME; continue; }
+        if (p == L"end") { vk = VK_END; continue; }
+        if (p == L"up") { vk = VK_UP; continue; }
+        if (p == L"down") { vk = VK_DOWN; continue; }
+        if (p == L"left") { vk = VK_LEFT; continue; }
+        if (p == L"right") { vk = VK_RIGHT; continue; }
+        if (p.size() == 1) {
+            const wchar_t c = p[0];
+            if (c >= L'a' && c <= L'z') { vk = (UINT)(c - L'a' + L'A'); continue; }
+            if (c >= L'0' && c <= L'9') { vk = (UINT)c; continue; }
+            vk = (UINT)c;
+            continue;
+        }
+        if (p.size() >= 2 && p[0] == L'f') {
+            const int n = ParseInt(p.substr(1), 0);
+            if (n >= 1 && n <= 24) { vk = (UINT)(VK_F1 + n - 1); continue; }
+        }
+        return 0;   //  an unknown key name makes the whole spec invalid
+    }
+    if (vk == 0) return 0;
+    //  The modifiers and the virtual key are packed into separate
+    //  bytes: the modifiers in the high byte, the key in the low one.
+    return (mods << 8) | (vk & 0xFF);
+}
+
+//----------------------------------------------------------------------
+//  Results
+//----------------------------------------------------------------------
+void RebuildResults(AppState& st) {
+    st.appResults.clear();
+    st.webResults.clear();
+    st.appSelected = 0;
+    st.webSelected = 0;
+
+    if (!st.scanDone.load(std::memory_order_acquire)) {
+        //  The scan has not finished yet, so the left pane stays empty
+        //  and only the providers are listed.
+        BuildResults(st.query, st.index, st.providers, 0, st.cfg.maxProviderResults,
+                     st.appResults, st.webResults);
+        st.webSelected = 0;
+        return;
+    }
+
+    BuildResults(st.query, st.index, st.providers, st.cfg.maxAppResults,
+                 st.cfg.maxProviderResults, st.appResults, st.webResults);
+
+    if (st.query.empty()) {
+        //  With nothing typed the left pane shows the applications that
+        //  are used most often, which is a more useful empty state than
+        //  an empty box.
+        const std::vector<AppEntry> all = st.index.Snapshot();
+        std::vector<int> order(all.size());
+        for (size_t i = 0; i < all.size(); ++i) order[i] = (int)i;
+        std::sort(order.begin(), order.end(), [&all](int x, int y) {
+            if (all[(size_t)x].uses != all[(size_t)y].uses)
+                return all[(size_t)x].uses > all[(size_t)y].uses;
+            return LowerAscii(all[(size_t)x].name) < LowerAscii(all[(size_t)y].name);
+        });
+        st.appResults.clear();
+        int n = 0;
+        for (int idx : order) {
+            if (n >= st.cfg.maxAppResults) break;
+            Result r;
+            r.kind = ResultKind::App;
+            r.index = idx;
+            r.label = all[(size_t)idx].name;
+            r.sublabel = SubLabelFor(all[(size_t)idx]);
+            r.score = 1000.0 - (double)n;
+            st.appResults.push_back(r);
+            ++n;
+        }
+    }
+}
+
+HICON IconFor(AppState& st, const Result& r) {
+    if (r.kind != ResultKind::App) return nullptr;
+    const std::vector<AppEntry>& all = st.index.All();
+    if (r.index < 0 || r.index >= (int)all.size()) return nullptr;
+    const AppEntry& app = all[(size_t)r.index];
+
+    std::wstring key = app.target;
+    if (key.empty()) key = app.aumid;
+    if (key.empty()) key = app.name;
+    auto it = st.iconCache.find(key);
+    if (it != st.iconCache.end()) return it->second;
+
+    HICON icon = ExtractAppIcon(app);
+    st.iconCache[key] = icon;
+    return icon;
+}
+
+void SyncModel(AppState& st) {
+    st.model.query = st.query;
+    st.model.caret = st.caret;
+    st.model.focused = st.focused;
+    st.model.panelOpen = st.focused && st.showPanel;
+    st.model.caretOn = st.caretOn;
+    st.model.activePane = st.activePane;
+    st.model.clock = st.cfg.showClock ? ClockText() : L"";
+    //  The status line carries the configured text and then the keys
+    //  that are worth remembering.
+    st.model.hint = L"ENTER LAUNCH     TAB SWITCH     ESC CLEAR     CTRL+1-9 QUICK";
+    if (!st.cfg.statusText.empty())
+        st.model.hint = st.cfg.statusText + L"     " + st.model.hint;
+
+    st.model.apps.rows.clear();
+    st.model.apps.title = L"APPLICATIONS";
+    for (const Result& r : st.appResults) {
+        UiRow row;
+        row.label = r.label;
+        row.sublabel = r.sublabel;
+        row.highlightCount = std::min(r.highlightCount, 64);
+        if (row.highlightCount > 0)
+            memcpy(row.highlight, r.highlight, sizeof(int) * (size_t)row.highlightCount);
+        row.icon = IconFor(st, r);
+        st.model.apps.rows.push_back(row);
+    }
+    st.model.apps.selected = st.appSelected;
+    st.model.apps.scroll = 0;
+
+    st.model.web.rows.clear();
+    st.model.web.title = L"WEB SEARCH";
+    for (const Result& r : st.webResults) {
+        UiRow row;
+        row.label = r.label;
+        row.sublabel = r.sublabel;
+        row.highlightCount = std::min(r.highlightCount, 64);
+        if (row.highlightCount > 0)
+            memcpy(row.highlight, r.highlight, sizeof(int) * (size_t)row.highlightCount);
+        st.model.web.rows.push_back(row);
+    }
+    st.model.web.selected = st.webSelected;
+    st.model.web.scroll = 0;
+}
+
+//----------------------------------------------------------------------
+//  Geometry
+//----------------------------------------------------------------------
+void ComputePosition(AppState& st, const Layout& lay, int& outX, int& outY) {
+    HMONITOR mon = MonitorFromWindow(st.hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!mon) mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi;
+    ZeroMemory(&mi, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(mon, &mi);
+    const RECT& wa = mi.rcWork;
+
+    const int margin = (int)std::lround((float)st.cfg.margin * st.renderer.Scale());
+    const int w = lay.width, h = lay.height;
+    const std::wstring pos = LowerAscii(st.cfg.position);
+
+    int x = wa.left + (wa.right - wa.left - w) / 2;
+    int y = wa.top + margin;
+    if (pos == L"top-left") {
+        x = wa.left + margin;  y = wa.top + margin;
+    } else if (pos == L"top-right") {
+        x = wa.right - margin - w; y = wa.top + margin;
+    } else if (pos == L"bottom-left") {
+        x = wa.left + margin;  y = wa.bottom - margin - h;
+    } else if (pos == L"bottom-right") {
+        x = wa.right - margin - w; y = wa.bottom - margin - h;
+    } else if (pos == L"bottom-center") {
+        x = wa.left + (wa.right - wa.left - w) / 2; y = wa.bottom - margin - h;
+    } else if (pos == L"center") {
+        x = wa.left + (wa.right - wa.left - w) / 2;
+        y = wa.top + (wa.bottom - wa.top - h) / 2;
+    }
+    outX = x;
+    outY = y;
+}
+
+void Redraw(AppState& st) {
+    if (!st.hwnd) return;
+    SyncModel(st);
+    const Layout lay = st.renderer.ComputeLayout(st.model);
+    int x = 0, y = 0;
+    ComputePosition(st, lay, x, y);
+    SetWindowPos(st.hwnd, st.cfg.alwaysOnTop ? HWND_TOPMOST : HWND_TOP, x, y, lay.width, lay.height,
+                 SWP_NOACTIVATE | (st.cfg.alwaysOnTop ? 0 : SWP_NOZORDER));
+    const int alpha = (!st.focused && st.cfg.dimWhenUnfocused) ? st.cfg.dimAlpha : 255;
+    st.renderer.Present(st.hwnd, st.model, lay, alpha);
+}
+
+//----------------------------------------------------------------------
+//  Actions
+//----------------------------------------------------------------------
+void LaunchAppAt(AppState& st, int index) {
+    const std::vector<AppEntry> all = st.index.Snapshot();
+    if (index < 0 || index >= (int)all.size()) return;
+    const AppEntry& app = all[(size_t)index];
+    const bool ok = LaunchApp(app);
+    {
+        char line[512];
+        snprintf(line, sizeof(line), "launch app=%ls kind=%d aumid=%ls target=%ls ok=%d",
+                 app.name.c_str(), (int)app.kind, app.aumid.c_str(), app.target.c_str(),
+                 ok ? 1 : 0);
+        LogLine(st, line);
+    }
+    if (ok) st.index.RecordUse(app.name);
+    st.query.clear();
+    st.caret = 0;
+    RebuildResults(st);
+}
+
+void OpenWebAt(AppState& st, int index) {
+    if (index < 0 || index >= (int)st.providers.size()) return;
+    const std::wstring url = BuildProviderUrl(st.providers[(size_t)index], st.query);
+    OpenUrl(url, st.cfg.defaultBrowser);
+    {
+        char line[512];
+        snprintf(line, sizeof(line), "open web provider=%ls url=%ls",
+                 st.providers[(size_t)index].label.c_str(), url.c_str());
+        LogLine(st, line);
+    }
+    st.query.clear();
+    st.caret = 0;
+    RebuildResults(st);
+}
+
+void ActivateSelection(AppState& st) {
+    if (st.activePane == 0) {
+        if (st.appSelected >= 0 && st.appSelected < (int)st.appResults.size())
+            LaunchAppAt(st, st.appResults[(size_t)st.appSelected].index);
+    } else {
+        if (st.webSelected >= 0 && st.webSelected < (int)st.webResults.size())
+            OpenWebAt(st, st.webResults[(size_t)st.webSelected].index);
+    }
+}
+
+void FocusSearch(AppState& st) {
+    if (!st.hwnd) return;
+
+    //  The bar is a tool window, so it has to take the foreground
+    //  away from whatever the user was working in.  Windows refuses
+    //  that when the call comes from a background thread, so the
+    //  input queues are attached to the foreground thread for the
+    //  duration of the call.
+    const HWND foreground = GetForegroundWindow();
+    DWORD fgThread = 0;
+    if (foreground) fgThread = GetWindowThreadProcessId(foreground, nullptr);
+    const DWORD selfThread = GetCurrentThreadId();
+    const bool attached = (fgThread != 0 && fgThread != selfThread) &&
+                         AttachThreadInput(selfThread, fgThread, TRUE) != FALSE;
+
+    ShowWindow(st.hwnd, SW_SHOWNA);
+    SetForegroundWindow(st.hwnd);
+    SetActiveWindow(st.hwnd);
+    SetFocus(st.hwnd);
+    BringWindowToTop(st.hwnd);
+
+    if (attached) AttachThreadInput(selfThread, fgThread, FALSE);
+    st.focused = true;
+    st.caret = (int)st.query.size();
+    st.caretOn = true;
+    RebuildResults(st);
+    Redraw(st);
+    SetTimer(st.hwnd, kTimerCaret, 500, nullptr);
+}
+
+//----------------------------------------------------------------------
+//  Hit testing
+//----------------------------------------------------------------------
+struct Hit {
+    enum Kind { None, Bar, App, Web } kind = None;
+    int index = -1;
+};
+
+Hit HitTest(AppState& st, int px, int py) {
+    Hit hit;
+    const Layout lay = st.renderer.ComputeLayout(st.model);
+    if (lay.panel.h <= 0) {
+        if (lay.bar.Contains(px, py)) hit.kind = Hit::Bar;
+        return hit;
+    }
+    if (lay.bar.Contains(px, py)) {
+        hit.kind = Hit::Bar;
+        return hit;
+    }
+    for (int i = 0; i < lay.appRowsVisible; ++i) {
+        const int idx = lay.appScroll + i;
+        if (lay.AppRowRect(idx).Contains(px, py)) {
+            hit.kind = Hit::App;
+            hit.index = idx;
+            return hit;
+        }
+    }
+    for (int i = 0; i < lay.webRowsVisible; ++i) {
+        const int idx = lay.webScroll + i;
+        if (lay.WebRowRect(idx).Contains(px, py)) {
+            hit.kind = Hit::Web;
+            hit.index = idx;
+            return hit;
+        }
+    }
+    return hit;
+}
+
+//----------------------------------------------------------------------
+//  Tray icon
+//----------------------------------------------------------------------
+bool AddTrayIcon(AppState& st) {
+    st.nid = {};
+    st.nid.cbSize = sizeof(NOTIFYICONDATAW);
+    st.nid.hWnd = st.hwnd;
+    st.nid.uID = 1;
+    st.nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    st.nid.uCallbackMessage = kTrayMessage;
+    wcsncpy(st.nid.szTip, L"JARVIS Search", ARRAYSIZE(st.nid.szTip) - 1);
+
+    HICON icon = nullptr;
+    wchar_t path[32768];
+    if (GetModuleFileNameW(nullptr, path, 32768) != 0)
+        ExtractIconExW(path, 0, nullptr, &icon, 1);
+    if (!icon) icon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+    st.nid.hIcon = icon;
+
+    if (Shell_NotifyIconW(NIM_ADD, &st.nid)) {
+        st.trayAdded = true;
+        return true;
+    }
+    if (icon) DestroyIcon(icon);
+    return false;
+}
+
+void RemoveTrayIcon(AppState& st) {
+    if (!st.trayAdded) return;
+    Shell_NotifyIconW(NIM_DELETE, &st.nid);
+    if (st.nid.hIcon) {
+        DestroyIcon(st.nid.hIcon);
+        st.nid.hIcon = nullptr;
+    }
+    st.trayAdded = false;
+}
+
+void ShowTrayMenu(AppState& st) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, kTraySearchId, L"Open search");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | MF_CHECKED,
+                kTrayAutoId, L"Start at logon");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kTrayQuitId, L"Quit");
+
+    POINT pt;
+    GetCursorPos(&pt);
+    SetForegroundWindow(st.hwnd);
+    const UINT cmd = (UINT)TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                                          pt.x, pt.y, 0, st.hwnd, nullptr);
+    PostMessageW(st.hwnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+
+    if (cmd == kTraySearchId) {
+        FocusSearch(st);
+    } else if (cmd == kTrayAutoId) {
+        const bool want = !IsAutostartEnabled();
+        if (SetAutostartEnabled(want)) {
+            st.cfg.autostart = want;
+            SaveConfigKey(ExeRelativePath(L"config.txt"), L"autostart", want ? L"1" : L"0");
+        }
+    } else if (cmd == kTrayQuitId) {
+        DestroyWindow(st.hwnd);
+    }
+}
+
+//----------------------------------------------------------------------
+//  Window procedure
+//----------------------------------------------------------------------
+//  Every printable character is simply typed.  The keys that are not
+//  characters - enter, escape, tab, backspace - are handled in the
+//  key down handler, so that a letter can never be a command.
+void OnChar(AppState& st, WPARAM wp) {
+    const wchar_t ch = (wchar_t)wp;
+    if (ch == 13 || ch == 10) return;    //  enter, see OnKeyDown
+    {
+        char line[128];
+        snprintf(line, sizeof(line), "char=%d query=%ls", (int)ch, st.query.c_str());
+        LogLine(st, line);
+    }
+    if (ch == 8) {                                  //  backspace
+        if (st.caret > 0) {
+            st.query.erase((size_t)st.caret - 1, 1);
+            --st.caret;
+        }
+    } else if (ch >= 32 && ch != 127) {
+        st.query.insert((size_t)st.caret, 1, ch);
+        ++st.caret;
+    } else {
+        return;
+    }
+    st.caretOn = true;
+    RebuildResults(st);
+    Redraw(st);
+}
+
+void OnKeyDown(AppState& st, WPARAM wp) {
+    const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+
+    //  Ctrl+1 .. Ctrl+9 launch the numbered application directly.
+    if (ctrl && wp >= '1' && wp <= '9') {
+        const int n = (int)(wp - '1');
+        if (n < (int)st.appResults.size()) {
+            LaunchAppAt(st, st.appResults[(size_t)n].index);
+            Redraw(st);
+        }
+        return;
+    }
+
+    switch (wp) {
+        case VK_RETURN:
+            ActivateSelection(st);
+            Redraw(st);
+            return;
+        case VK_ESCAPE:
+            if (!st.query.empty()) {
+                st.query.clear();
+                st.caret = 0;
+            } else {
+                SetFocus(nullptr);
+            }
+            st.caretOn = true;
+            RebuildResults(st);
+            Redraw(st);
+            return;
+        case VK_BACK:
+            if (st.caret > 0) {
+                st.query.erase((size_t)st.caret - 1, 1);
+                --st.caret;
+            }
+            break;
+        case VK_DELETE:
+            if (st.caret < (int)st.query.size()) st.query.erase((size_t)st.caret, 1);
+            break;
+        case VK_LEFT:
+            if (st.caret > 0) --st.caret;
+            break;
+        case VK_RIGHT:
+            if (st.caret < (int)st.query.size()) ++st.caret;
+            break;
+        case VK_HOME:
+            st.caret = 0;
+            break;
+        case VK_END:
+            st.caret = (int)st.query.size();
+            break;
+        case VK_TAB:
+            st.activePane = st.activePane ? 0 : 1;
+            break;
+        case VK_UP:
+        case VK_DOWN: {
+            const int delta = (wp == VK_DOWN) ? 1 : -1;
+            if (st.activePane == 0) {
+                const int n = (int)st.appResults.size();
+                if (n > 0) st.appSelected = (st.appSelected + delta + n) % n;
+            } else {
+                const int n = (int)st.webResults.size();
+                if (n > 0) st.webSelected = (st.webSelected + delta + n) % n;
+            }
+            break;
+        }
+        case VK_PRIOR:
+        case VK_NEXT: {
+            const int delta = (wp == VK_NEXT) ? 3 : -3;
+            if (st.activePane == 0) {
+                const int n = (int)st.appResults.size();
+                if (n > 0) st.appSelected = std::max(0, std::min(n - 1, st.appSelected + delta));
+            } else {
+                const int n = (int)st.webResults.size();
+                if (n > 0) st.webSelected = std::max(0, std::min(n - 1, st.webSelected + delta));
+            }
+            break;
+        }
+        default:
+            return;
+    }
+    st.caretOn = true;
+    RebuildResults(st);
+    Redraw(st);
+}
+
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    AppState* st = g_app;
+
+    //  A second copy of the bar asked the first one to come up.
+    if (g_showMessage != 0 && msg == g_showMessage) {
+        if (st) FocusSearch(*st);
+        return 0;
+    }
+    if (!st) return DefWindowProcW(hwnd, msg, wp, lp);
+
+    switch (msg) {
+        case WM_CREATE:
+            st->hwnd = hwnd;
+            return 0;
+
+        case WM_ERASEBKGND:
+            return 1;   //  the surface is layered, there is no background
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            BeginPaint(hwnd, &ps);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        case WM_SETFOCUS:
+            st->focused = true;
+            st->caretOn = true;
+            st->caret = (int)st->query.size();
+            RebuildResults(*st);
+            Redraw(*st);
+            SetTimer(hwnd, kTimerCaret, 500, nullptr);
+            return 0;
+
+        case WM_KILLFOCUS:
+            //  The query is kept: losing the focus by accident should
+            //  not throw away what was typed.
+            st->focused = false;
+            st->activePane = 0;
+            KillTimer(hwnd, kTimerCaret);
+            RebuildResults(*st);
+            Redraw(*st);
+            return 0;
+
+        case WM_CHAR:
+            OnChar(*st, wp);
+            return 0;
+
+        case WM_KEYDOWN:
+            OnKeyDown(*st, wp);
+            return 0;
+
+        case WM_SYSCHAR:
+            return 0;   //  the bar is not a menu
+
+        case WM_LBUTTONDOWN: {
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
+            const int x = GET_X_LPARAM(lp);
+            const int y = GET_Y_LPARAM(lp);
+            {
+                char line[256];
+                snprintf(line, sizeof(line), "down at=%d,%d focused=%d", x, y, st->focused ? 1 : 0);
+                LogLine(*st, line);
+            }
+            const Hit hit = HitTest(*st, x, y);
+            if (hit.kind == Hit::Bar) {
+                st->caret = (int)st->query.size();
+            } else if (hit.kind == Hit::App) {
+                st->activePane = 0;
+                st->appSelected = hit.index;
+            } else if (hit.kind == Hit::Web) {
+                st->activePane = 1;
+                st->webSelected = hit.index;
+            }
+            Redraw(*st);
+            return 0;
+        }
+
+        case WM_LBUTTONUP: {
+            const int x = GET_X_LPARAM(lp);
+            const int y = GET_Y_LPARAM(lp);
+            const Hit hit = HitTest(*st, x, y);
+            {
+                char line[512];
+                std::string label;
+                if (hit.kind == Hit::App && hit.index >= 0 &&
+                    hit.index < (int)st->appResults.size())
+                    label = NarrowUtf8(st->appResults[(size_t)hit.index].label);
+                snprintf(line, sizeof(line),
+                         "click at=%d,%d kind=%d index=%d apps=%d web=%d query=%ls label=%s",
+                         x, y, (int)hit.kind, hit.index,
+                         (int)st->appResults.size(), (int)st->webResults.size(),
+                         st->query.c_str(), label.c_str());
+                LogLine(*st, line);
+            }
+            if (hit.kind == Hit::App) {
+                st->activePane = 0;
+                st->appSelected = hit.index;
+                if (st->appSelected < (int)st->appResults.size())
+                    LaunchAppAt(*st, st->appResults[(size_t)st->appSelected].index);
+            } else if (hit.kind == Hit::Web) {
+                st->activePane = 1;
+                st->webSelected = hit.index;
+                if (st->webSelected < (int)st->webResults.size())
+                    OpenWebAt(*st, st->webResults[(size_t)st->webSelected].index);
+            }
+            Redraw(*st);
+            return 0;
+        }
+
+        case WM_MOUSEWHEEL: {
+            const int delta = GET_WHEEL_DELTA_WPARAM(wp);
+            POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(hwnd, &pt);
+            const Layout lay = st->renderer.ComputeLayout(st->model);
+            const bool overWeb = lay.webPane.w > 0 && pt.x >= lay.webPane.x;
+            UiPane& pane = overWeb ? st->model.web : st->model.apps;
+            const int total = (int)pane.rows.size();
+            const int visible = overWeb ? lay.webRowsVisible : lay.appRowsVisible;
+            if (total > visible) {
+                int scroll = overWeb ? lay.webScroll : lay.appScroll;
+                scroll -= delta / WHEEL_DELTA;
+                const int maxScroll = std::max(0, total - visible);
+                scroll = std::max(0, std::min(maxScroll, scroll));
+                if (overWeb) st->webSelected = scroll; else st->appSelected = scroll;
+                st->model.web.scroll = overWeb ? scroll : st->model.web.scroll;
+                st->model.apps.scroll = overWeb ? st->model.apps.scroll : scroll;
+            }
+            Redraw(*st);
+            return 0;
+        }
+
+        case WM_TIMER: {
+            if (wp == kTimerCaret) {
+                if (st->focused) {
+                    st->caretOn = !st->caretOn;
+                    Redraw(*st);
+                }
+            } else if (wp == kTimerClock) {
+                const std::wstring now = st->cfg.showClock ? ClockText() : L"";
+                if (now != st->model.clock) Redraw(*st);
+            }
+            return 0;
+        }
+
+
+        case WM_HOTKEY:
+            if (wp == (WPARAM)kHotkeyId) {
+                FocusSearch(*st);
+            }
+            return 0;
+
+        case kScanDoneMsg:
+            //  The application list is complete now, so the panes are
+            //  built again with everything in them.
+            RebuildResults(*st);
+            Redraw(*st);
+            return 0;
+
+        case kTrayMessage: {
+            if (lp == WM_LBUTTONUP || lp == WM_LBUTTONDBLCLK) {
+                FocusSearch(*st);
+            } else if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) {
+                ShowTrayMenu(*st);
+            }
+            return 0;
+        }
+
+        case WM_COMMAND: {
+            const int id = LOWORD(wp);
+            if (id == kTraySearchId) FocusSearch(*st);
+            else if (id == kTrayAutoId) {
+                const bool want = !IsAutostartEnabled();
+                if (SetAutostartEnabled(want)) {
+                    st->cfg.autostart = want;
+                    SaveConfigKey(ExeRelativePath(L"config.txt"), L"autostart", want ? L"1" : L"0");
+                }
+            } else if (id == kTrayQuitId) {
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        }
+
+        case WM_DESTROY:
+            RemoveTrayIcon(*st);
+            PostQuitMessage(0);
+            return 0;
+
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+//----------------------------------------------------------------------
+//  Self test
+//----------------------------------------------------------------------
+int RunSelfTest(AppState& st) {
+    const ULONGLONG t0 = GetTickCount64();
+
+    st.providers = DefaultProviders();
+    st.model.focused = true;
+    st.model.panelOpen = true;
+    st.model.query = L"code";
+    st.model.caret = 4;
+    st.model.caretOn = true;
+    st.model.clock = L"09:41";
+    st.model.hint = L"ENTER LAUNCH     TAB SWITCH     ESC CLEAR     CTRL+1-9 QUICK";
+    st.model.apps.title = L"APPLICATIONS";
+    st.model.web.title = L"WEB SEARCH";
+
+    const wchar_t* mockApps[] = {L"Visual Studio Code", L"Google Chrome", L"Windows Terminal",
+                                 L"Notepad", L"Code", L"Adobe Photoshop"};
+    const wchar_t* mockSubs[] = {L"START MENU", L"START MENU", L"START MENU",
+                                 L"START MENU", L"START MENU", L"START MENU"};
+    for (int i = 0; i < 6; ++i) {
+        UiRow row;
+        row.label = mockApps[i];
+        row.sublabel = mockSubs[i];
+        st.model.apps.rows.push_back(row);
+    }
+    st.model.apps.selected = 0;
+
+    for (size_t i = 0; i < st.providers.size() && i < 10; ++i) {
+        UiRow row;
+        row.label = st.providers[i].label;
+        row.sublabel = st.providers[i].hint;
+        st.model.web.rows.push_back(row);
+    }
+    st.model.web.selected = 0;
+
+    const Layout lay = st.renderer.ComputeLayout(st.model);
+    const std::wstring png = st.dumpPath.empty() ? ExeRelativePath(L"JarvisSearch_frame.png")
+                                                 : st.dumpPath;
+    const bool ok = st.renderer.DumpPng(st.model, lay, png);
+
+    char line[512];
+    snprintf(line, sizeof(line),
+             "selftest font=%s scale=%.3f size=%dx%d apps=%d web=%d png=%s ok=%d",
+             st.renderer.Scale() > 0 ? "resolved" : "none", (double)st.renderer.Scale(),
+             lay.width, lay.height, (int)st.model.apps.rows.size(),
+             (int)st.model.web.rows.size(), ok ? "written" : "failed", ok ? 1 : 0);
+    LogLine(st, line);
+    snprintf(line, sizeof(line), "selftest_ms=%llu", (unsigned long long)(GetTickCount64() - t0));
+    LogLine(st, line);
+    return 0;
+}
+
+//----------------------------------------------------------------------
+//  Entry point
+//----------------------------------------------------------------------
+std::vector<std::wstring> SplitArgs(const std::wstring& cmd) {
+    std::vector<std::wstring> out;
+    size_t i = 0;
+    while (i < cmd.size()) {
+        while (i < cmd.size() && (cmd[i] == L' ' || cmd[i] == L'\t')) ++i;
+        if (i >= cmd.size()) break;
+        std::wstring tok;
+        if (cmd[i] == L'"') {
+            ++i;
+            while (i < cmd.size() && cmd[i] != L'"') tok.push_back(cmd[i++]);
+            if (i < cmd.size()) ++i;
+        } else {
+            while (i < cmd.size() && cmd[i] != L' ' && cmd[i] != L'\t') tok.push_back(cmd[i++]);
+        }
+        out.push_back(tok);
+    }
+    return out;
+}
+
+int Run(HINSTANCE instance, const std::wstring& cmdLine) {
+    AppState st;
+    g_app = &st;
+    st.inst = instance;
+
+    const std::vector<std::wstring> args = SplitArgs(cmdLine);
+    bool installAuto = false, uninstallAuto = false;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::wstring& a = args[i];
+        if (a == L"--selftest") st.selftest = true;
+        else if (a == L"--log" && i + 1 < args.size()) st.logPath = args[++i];
+        else if (a == L"--dump" && i + 1 < args.size()) st.dumpPath = args[++i];
+        else if (a == L"--install-autostart") installAuto = true;
+        else if (a == L"--uninstall-autostart") uninstallAuto = true;
+        else if (a == L"--list-apps") st.listApps = true;
+        else if (a == L"--query" && i + 1 < args.size()) st.queryArg = args[++i];
+    }
+
+    if (installAuto) {
+        const bool ok = SetAutostartEnabled(true);
+        LogLine(st, ok ? "autostart enabled" : "autostart failed");
+        return ok ? 0 : 1;
+    }
+    if (uninstallAuto) {
+        const bool ok = SetAutostartEnabled(false);
+        LogLine(st, ok ? "autostart disabled" : "autostart failed");
+        return ok ? 0 : 1;
+    }
+
+    const std::wstring cfgPath = ExeRelativePath(L"config.txt");
+    const bool cfgOk = LoadConfig(cfgPath, st.cfg);
+    st.providers = DefaultProviders();
+    {
+        char line[256];
+        snprintf(line, sizeof(line), "config ok=%d pos=%ls font=%ls size=%d",
+                 cfgOk ? 1 : 0, st.cfg.position.c_str(), st.cfg.font.c_str(),
+                 st.cfg.fontSize);
+        LogLine(st, line);
+    }
+
+    if (st.listApps) {
+        //  A diagnostic: write the whole index to a file so that the
+        //  names can be checked against what the shell really holds.
+        st.index.Scan(st.cfg.loadUwp);
+        const std::vector<AppEntry> all = st.index.Snapshot();
+        std::string text;
+        for (const AppEntry& e : all) {
+            text += NarrowUtf8(e.name);
+            text += '\t';
+            text += (e.kind == AppKind::Uwp ? "uwp" : "lnk");
+            text += '\t';
+            text += NarrowUtf8(e.target.empty() ? e.aumid : e.target);
+            text += '\n';
+        }
+        const std::wstring out = ExeRelativePath(L"apps.txt");
+        WriteTextFile(out, text);
+        char line[128];
+        snprintf(line, sizeof(line), "list-apps count=%d file=%ls", (int)all.size(), out.c_str());
+        LogLine(st, line);
+        return 0;
+    }
+
+    if (!st.queryArg.empty()) {
+        //  A diagnostic: show what a query matches and in what order.
+        st.index.Scan(st.cfg.loadUwp);
+        st.providers = DefaultProviders();
+        std::vector<Result> apps;
+        std::vector<Result> web;
+        BuildResults(st.queryArg, st.index, st.providers, 50, 50, apps, web);
+        std::string text;
+        text += "query\t" + NarrowUtf8(st.queryArg) + "\n";
+        for (const Result& r : apps) {
+            text += "app\t" + NarrowUtf8(r.label) + "\t" + std::to_string(r.index) + "\t" +
+                    std::to_string((int)r.score) + "\n";
+        }
+        for (const Result& r : web) {
+            text += "web\t" + NarrowUtf8(r.label) + "\n";
+        }
+        const std::wstring out = ExeRelativePath(L"query.txt");
+        WriteTextFile(out, text);
+        return 0;
+    }
+
+    if (st.selftest) {
+        //  The self test needs a window handle to resolve the scale.
+        WNDCLASSEXW wc; ZeroMemory(&wc, sizeof(wc)); wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = WndProc;
+        wc.hInstance = instance;
+        wc.lpszClassName = L"JarvisSearchTest";
+        RegisterClassExW(&wc);
+        st.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"", WS_POPUP, 0, 0, 10, 10,
+                                  nullptr, nullptr, instance, nullptr);
+        if (!st.hwnd) return 1;
+        if (!st.renderer.Init(st.cfg, st.hwnd)) return 1;
+        return RunSelfTest(st);
+    }
+
+    WNDCLASSEXW wc; ZeroMemory(&wc, sizeof(wc)); wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = instance;
+    wc.lpszClassName = L"JarvisSearchBar";
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+    wc.hbrBackground = nullptr;
+    if (!RegisterClassExW(&wc)) return 1;
+
+    g_showMessage = RegisterWindowMessageW(L"JarvisSearchShowBar");
+
+    //  Only one bar may be on the screen.  A second copy asks the
+    //  first one to come to the front and then leaves.
+    HANDLE single = CreateMutexW(nullptr, TRUE, kMutexName);
+    const bool alreadyRunning = (single != nullptr && GetLastError() == ERROR_ALREADY_EXISTS);
+    if (alreadyRunning) {
+        if (g_showMessage) PostMessageW(HWND_BROADCAST, g_showMessage, 0, 0);
+        if (single) CloseHandle(single);
+        return 0;
+    }
+
+    DWORD exStyle = WS_EX_LAYERED | WS_EX_TOOLWINDOW;
+    if (st.cfg.alwaysOnTop) exStyle |= WS_EX_TOPMOST;
+
+    st.hwnd = CreateWindowExW(exStyle, wc.lpszClassName, L"JARVIS Search", WS_POPUP, 0, 0,
+                              (int)st.cfg.barWidth, (int)st.cfg.barHeight, nullptr, nullptr,
+                              instance, nullptr);
+    if (!st.hwnd) return 1;
+
+    if (!st.renderer.Init(st.cfg, st.hwnd)) return 1;
+
+    //  The global hotkey is a convenience, not a requirement: if it is
+    //  taken by another program the bar still works by being clicked.
+    const UINT hotkey = ParseHotkey(st.cfg.hotkey);
+    if (hotkey) {
+        const UINT mods = (hotkey >> 8) & 0xFF;
+        const UINT vk = hotkey & 0xFF;
+        if (!RegisterHotKey(st.hwnd, kHotkeyId, mods | MOD_NOREPEAT, vk))
+            LogLine(st, "hotkey not registered, another program owns it");
+    }
+
+    if (st.cfg.showTray) AddTrayIcon(st);
+
+    //  The application list is built on a worker thread so that the bar
+    //  is on screen immediately.
+    st.scanThread = std::thread([&st]() {
+        st.index.Scan(st.cfg.loadUwp);
+        st.scanDone.store(true, std::memory_order_release);
+        //  Tell the window, so that a query typed before the scan
+        //  finished is run again against the full list.
+        PostMessageW(st.hwnd, kScanDoneMsg, 0, 0);
+    });
+
+    st.focused = false;
+    Redraw(st);
+    ShowWindow(st.hwnd, SW_SHOWNOACTIVATE);
+    {
+        char line[256];
+        RECT r{};
+        GetWindowRect(st.hwnd, &r);
+        snprintf(line, sizeof(line), "ready rect=%ld,%ld,%ld,%ld scale=%.2f hotkey=%ls",
+                 (long)r.left, (long)r.top, (long)r.right, (long)r.bottom,
+                 (double)st.renderer.Scale(), st.cfg.hotkey.c_str());
+        LogLine(st, line);
+    }
+    SetTimer(st.hwnd, kTimerClock, 1000, nullptr);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (st.scanThread.joinable()) st.scanThread.join();
+    if (single) { ReleaseMutex(single); CloseHandle(single); }
+    UnregisterHotKey(st.hwnd, kHotkeyId);
+    g_app = nullptr;
+    return 0;
+}
+
+}  // namespace
+
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR lpCmdLine, int) {
+    //  DPI awareness has to be established before any window or GDI+
+    //  work, otherwise a layered window is scaled and misplaced by the
+    //  compositor.  SetProcessDpiAwarenessContext lives in user32 on
+    //  Windows 10 1703+, so it is resolved dynamically and the binary
+    //  still runs on older systems.
+    {
+        typedef BOOL(WINAPI* SetCtxFn)(DPI_AWARENESS_CONTEXT);
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        if (user32) {
+            union {
+                FARPROC p;
+                SetCtxFn f;
+            } proc;
+            proc.p = GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+            const SetCtxFn setCtx = proc.f;
+            if (setCtx) {
+                if (setCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) goto dpiReady;
+                if (setCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE)) goto dpiReady;
+            }
+        }
+        SetProcessDPIAware();
+    }
+dpiReady:
+    const int rc = Run(instance, lpCmdLine ? lpCmdLine : L"");
+    return rc;
+}

@@ -1,0 +1,86 @@
+# =====================================================================
+# JARVIS SEARCH - configuration
+# ---------------------------------------------------------------------
+# Format: key=value, one setting per line.
+#
+#   * UTF-8, no BOM. A byte order mark, if present, is ignored.
+#   * Lines beginning with "#" are comments and are ignored.
+#   * Whitespace around a key or a value is trimmed.
+#   * Unknown keys are ignored, so it is safe to leave old settings
+#     in place after an upgrade.
+#
+# THIS FILE IS RE-READ ON EVERY LAUNCH. The file is looked for next to
+# JarvisSearch.exe. If it is missing, the built-in defaults are used.
+# =====================================================================
+
+# --- Appearance ----------------------------------------------------
+
+# Monospace font family for all text.
+# Fallback chain if unavailable: Cascadia Mono, Consolas,
+# Lucida Console, Courier New.
+font=Cascadia Mono
+
+# Logical pixel size of the query text, scaled by the display DPI.
+font_size=15
+
+# Logical pixel size of the labels and the status line.
+label_font_size=10
+
+# Text shown in the status line of the result panel.
+status_text=SYSTEM ONLINE
+
+# --- Geometry ------------------------------------------------------
+
+# Where the bar sits inside the work area of the monitor.
+# One of: top-center, top-left, top-right, bottom-center,
+#         bottom-left, bottom-right, center.
+position=top-center
+
+# Distance in logical pixels from the edge of the work area.
+margin=24
+
+# Width and height of the search bar in logical pixels.
+bar_width=680
+bar_height=48
+
+# How many rows each pane shows at once.
+max_app_results=9
+max_provider_results=12
+
+# Height of one result row in logical pixels.
+row_height=30
+
+# --- Behaviour -----------------------------------------------------
+
+# Keep the bar above every other window.
+always_on_top=1
+
+# Fade the bar while it does not have the keyboard focus.
+dim_when_unfocused=1
+
+# How transparent the faded bar becomes, 0 (clear) to 255 (opaque).
+dim_alpha=70
+
+# Show the clock at the right end of the bar.
+show_clock=1
+
+# Show the notification area icon.
+show_tray=1
+
+# Register the Run entry so the bar starts with Windows.
+autostart=1
+
+# Also list the Microsoft Store applications.
+load_uwp=1
+
+# Draw the arc reactor left of the prompt.
+show_reactor=1
+
+# --- Keys ----------------------------------------------------------
+
+# Global hotkey that focuses the bar. Use + between the modifiers.
+hotkey=Ctrl+Alt+Space
+
+# Optional: an explicit browser for the web results. Empty means the
+# system default browser.
+default_browser=
