@@ -2,10 +2,12 @@
 //  JARVIS SEARCH  -  the view layer implementation.
 //
 //  The frame is composed on a 32 bit ARGB surface the size of the
-//  window, converted to premultiplied alpha and pushed to the screen
-//  with UpdateLayeredWindow(ULW_ALPHA), which is what gives the bar
-//  true per-pixel transparency: the shadow under the panel and the
-//  soft glow around the arcs blend with whatever is behind them.
+//  window and then flattened onto an opaque one: the alpha is resolved
+//  against the card colour and the result is mixed towards it by the
+//  fade factor.  The bar is an ordinary window, because a layered one
+//  would be composited by the desktop window manager in a pass of its
+//  own and would float above every application no matter what the z
+//  order says.
 //
 //  Nothing is animated while the bar is idle.  The caret blinks and
 //  the clock ticks, and that is the entire idle cost.
@@ -24,7 +26,7 @@ namespace {
 //----------------------------------------------------------------------
 //  Palette
 //----------------------------------------------------------------------
-constexpr Rgba kPanelFill   = { 240,   4,  14,  24};  //  near black navy
+constexpr Rgba kPanelFill   = { 255,   4,  14,  24};  //  near black navy, solid
 constexpr Rgba kPanelEdge   = { 150,   0, 197, 232};  //  1px cyan border
 constexpr Rgba kBracket     = { 255, 125, 249, 255};  //  bright corner brackets
 constexpr Rgba kTextPrimary = { 255, 184, 244, 255};  //  main text
@@ -79,11 +81,18 @@ inline Gdiplus::Color ColScaled(const Rgba& c, int alpha) {
     return Gdiplus::Color((BYTE)a, c.r, c.g, c.b);
 }
 
-//  Straight alpha -> premultiplied alpha, without any per pixel division.
-//  round(c * a / 255) == (c * a * 257 + 32768) >> 16
-inline BYTE PremulChannel(BYTE c, BYTE a) {
-    const DWORD v = (DWORD)c * (DWORD)a;
-    return (BYTE)((v * 257u + 32768u) >> 16);
+//  True when the point lies inside a rounded rectangle.  The window
+//  region is cut with the same shape, so the PNG dump can paint the
+//  corners the way the screen shows them.
+bool InsideRoundedRect(float px, float py, float x, float y, float w, float h, float r) {
+    if (px < x || py < y || px > x + w || py > y + h) return false;
+    const float dx = std::min(px - x, x + w - px);
+    const float dy = std::min(py - y, y + h - py);
+    if (dx >= r || dy >= r) return true;
+    const float cx = (px < x + r) ? (x + r) : (x + w - r);
+    const float cy = (py < y + r) ? (y + r) : (y + h - r);
+    const float ex = px - cx, ey = py - cy;
+    return (ex * ex + ey * ey) <= r * r;
 }
 
 void BuildRoundedRect(Gdiplus::GraphicsPath& path, float x, float y, float w, float h, float r) {
@@ -123,56 +132,6 @@ public:
 private:
     ULONG_PTR m_token = 0;
     bool m_ok = false;
-};
-
-//----------------------------------------------------------------------
-//  A 32 bit DIB section plus the memory DC that holds it.
-//----------------------------------------------------------------------
-struct DibSurface {
-    HDC      dc   = nullptr;
-    HBITMAP  bmp  = nullptr;
-    HGDIOBJ  old  = nullptr;
-    BYTE*    bits = nullptr;
-    int      w = 0, h = 0;
-
-    bool Create(HDC screen, int width, int height) {
-        Destroy();
-        if (width <= 0 || height <= 0) return false;
-        w = width;
-        h = height;
-        BITMAPINFO bi;
-        ZeroMemory(&bi, sizeof(bi));
-        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = width;
-        //  The frame that is handed to UpdateLayeredWindow has to be
-        //  stored bottom up, which is the orientation the compositor
-        //  reads.  ComposeToDib mirrors the rows while it copies them.
-        bi.bmiHeader.biHeight = height;
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB;
-        bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void**)&bits, nullptr, 0);
-        if (!bmp || !bits) { Destroy(); return false; }
-        dc = CreateCompatibleDC(screen);
-        if (!dc) { Destroy(); return false; }
-        old = SelectObject(dc, bmp);
-        ZeroMemory(bits, (size_t)w * (size_t)h * 4);
-        return true;
-    }
-
-    void Destroy() {
-        if (dc && old) SelectObject(dc, old);
-        old = nullptr;
-        if (dc) { DeleteDC(dc); dc = nullptr; }
-        if (bmp) { DeleteObject(bmp); bmp = nullptr; }
-        bits = nullptr;
-        w = h = 0;
-    }
-
-    ~DibSurface() { Destroy(); }
-    DibSurface() = default;
-    DibSurface(const DibSurface&) = delete;
-    DibSurface& operator=(const DibSurface&) = delete;
 };
 
 //----------------------------------------------------------------------
@@ -275,6 +234,43 @@ bool WritePngRgb(const std::wstring& path, const BYTE* bgra, int w, int h) {
 }
 
 }  // namespace
+
+//======================================================================
+//  The window surface
+//======================================================================
+bool DibSurface::Create(HDC screen, int width, int height) {
+    Destroy();
+    if (width <= 0 || height <= 0) return false;
+    w = width;
+    h = height;
+    BITMAPINFO bi;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = width;
+    //  A negative height makes the DIB top down, so the rows are
+    //  stored the way they are drawn and the window can be painted
+    //  with a plain BitBlt.
+    bi.bmiHeader.biHeight = -height;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void**)&bits, nullptr, 0);
+    if (!bmp || !bits) { Destroy(); return false; }
+    dc = CreateCompatibleDC(screen);
+    if (!dc) { Destroy(); return false; }
+    old = SelectObject(dc, bmp);
+    ZeroMemory(bits, (size_t)w * (size_t)h * 4);
+    return true;
+}
+
+void DibSurface::Destroy() {
+    if (dc && old) SelectObject(dc, old);
+    old = nullptr;
+    if (dc) { DeleteDC(dc); dc = nullptr; }
+    if (bmp) { DeleteObject(bmp); bmp = nullptr; }
+    bits = nullptr;
+    w = h = 0;
+}
 
 //======================================================================
 //  Layout helpers
@@ -834,7 +830,7 @@ bool Renderer::ProbeGdiAlpha() {
     return true;
 }
 
-void Renderer::ComposeToDib(Gdiplus::Bitmap& src, BYTE* dst, int dstStride) {
+void Renderer::ComposeOpaque(Gdiplus::Bitmap& src, BYTE* dst, int dstStride, int fade) {
     const int w = (int)src.GetWidth();
     const int h = (int)src.GetHeight();
     if (w <= 0 || h <= 0) return;
@@ -844,29 +840,57 @@ void Renderer::ComposeToDib(Gdiplus::Bitmap& src, BYTE* dst, int dstStride) {
     if (src.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) !=
         Gdiplus::Ok)
         return;
+
+    //  The card colour is what the panel is made of, and it is also
+    //  what the frame dissolves into.  The rounded corners of the
+    //  card are therefore filled with it as well, and the window
+    //  region cuts them out again.
+    const int cr = kPanelFill.r, cg = kPanelFill.g, cb = kPanelFill.b;
+    int f = fade;
+    if (f < 0)   f = 0;
+    if (f > 255) f = 255;
+    const int finv = 255 - f;
+
     for (int y = 0; y < h; ++y) {
         const BYTE* s = (const BYTE*)bd.Scan0 + (size_t)y * bd.Stride;
-        //  The destination DIB is bottom up, so image row y is
-        //  stored in row h - 1 - y of the DIB.
-        BYTE* d = dst + (size_t)(h - 1 - y) * dstStride;
-        if (m_gdiPremultiplies) {
-            memcpy(d, s, (size_t)w * 4);
-        } else {
-            for (int x = 0; x < w; ++x) {
-                const BYTE a = s[3];
-                d[0] = PremulChannel(s[0], a);
-                d[1] = PremulChannel(s[1], a);
-                d[2] = PremulChannel(s[2], a);
-                d[3] = a;
-                s += 4;
-                d += 4;
+        BYTE* d = dst + (size_t)y * dstStride;
+        for (int x = 0; x < w; ++x) {
+            const int a = s[3];
+            const int inv = 255 - a;
+            //  A 32 bit ARGB surface stores the samples as B, G, R, A.
+            int r, g, b;
+            if (m_gdiPremultiplies) {
+                //  The colour already carries the alpha, so only the
+                //  part of the card that shows through is added.
+                b = s[0] + (cb * inv + 127) / 255;
+                g = s[1] + (cg * inv + 127) / 255;
+                r = s[2] + (cr * inv + 127) / 255;
+            } else {
+                b = (s[0] * a + cb * inv + 127) / 255;
+                g = (s[1] * a + cg * inv + 127) / 255;
+                r = (s[2] * a + cr * inv + 127) / 255;
             }
+            //  The fade mixes the finished pixel back towards the
+            //  card, which is how the resting bar looks softer than
+            //  the one that is being used.
+            r = (r * f + cr * finv + 127) / 255;
+            g = (g * f + cg * finv + 127) / 255;
+            b = (b * f + cb * finv + 127) / 255;
+            if (r > 255) r = 255;
+            if (g > 255) g = 255;
+            if (b > 255) b = 255;
+            d[0] = (BYTE)b;
+            d[1] = (BYTE)g;
+            d[2] = (BYTE)r;
+            d[3] = 255;
+            s += 4;
+            d += 4;
         }
     }
     src.UnlockBits(&bd);
 }
 
-bool Renderer::Present(HWND hwnd, const UiModel& model, const Layout& layout, int alpha) {
+bool Renderer::Present(HWND hwnd, const UiModel& model, const Layout& layout, int fade) {
     if (!hwnd || layout.width <= 0 || layout.height <= 0) return false;
 
     Gdiplus::Bitmap frame((INT)layout.width, (INT)layout.height, PixelFormat32bppARGB);
@@ -884,48 +908,43 @@ bool Renderer::Present(HWND hwnd, const UiModel& model, const Layout& layout, in
         g.Flush(Gdiplus::FlushIntentionSync);
     }
 
-    //  The frame is scaled by the dim factor before it reaches the
-    //  compositor, which is how an unfocused bar fades into the desktop.
-    if (alpha < 255) {
-        Gdiplus::Rect rect(0, 0, (INT)layout.width, (INT)layout.height);
-        Gdiplus::BitmapData bd;
-        if (frame.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) ==
-            Gdiplus::Ok) {
-            const int scale = alpha;
-            for (int y = 0; y < (int)layout.height; ++y) {
-                BYTE* s = (BYTE*)bd.Scan0 + (size_t)y * bd.Stride;
-                for (int x = 0; x < (int)layout.width; ++x) {
-                    BYTE* p = s + (size_t)x * 4;
-                    p[3] = (BYTE)(((int)p[3] * scale) / 255);
-                }
-            }
-            frame.UnlockBits(&bd);
-        }
-    }
-
+    //  The frame is flattened onto the window surface, so the panel is
+    //  a solid card and only its contents are softened by the fade.
     HDC screen = GetDC(nullptr);
     if (!screen) return false;
-
-    DibSurface dib;
-    if (!dib.Create(screen, layout.width, layout.height)) {
+    if (!m_surface.Create(screen, layout.width, layout.height)) {
         ReleaseDC(nullptr, screen);
         return false;
     }
-    ComposeToDib(frame, dib.bits, layout.width * 4);
-
-    RECT wr;
-    GetWindowRect(hwnd, &wr);
-    POINT dst = {wr.left, wr.top};
-    POINT srcPt = {0, 0};
-    SIZE size = {layout.width, layout.height};
-    BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    const BOOL ok = UpdateLayeredWindow(hwnd, screen, &dst, &size, dib.dc, &srcPt, 0, &blend,
-                                        ULW_ALPHA);
+    ComposeOpaque(frame, m_surface.bits, layout.width * 4, fade);
     ReleaseDC(nullptr, screen);
+
+    ApplyRegion(hwnd, layout);
+    InvalidateRect(hwnd, nullptr, FALSE);
 
     m_lastWidth = layout.width;
     m_lastHeight = layout.height;
-    return ok != FALSE;
+    return true;
+}
+
+void Renderer::Blit(HWND hwnd) {
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(hwnd, &ps);
+    if (dc && m_surface.dc && m_surface.w > 0 && m_surface.h > 0) {
+        BitBlt(dc, 0, 0, m_surface.w, m_surface.h, m_surface.dc, 0, 0, SRCCOPY);
+    }
+    EndPaint(hwnd, &ps);
+}
+
+void Renderer::ApplyRegion(HWND hwnd, const Layout& layout) {
+    if (!hwnd || layout.width <= 0 || layout.height <= 0) return;
+    const int radius = (int)std::lround(kCornerRadius * m_scale);
+    HRGN rgn = CreateRoundRectRgn(0, 0, layout.width + 1, layout.height + 1, radius * 2,
+                                  radius * 2);
+    if (!rgn) return;
+    //  The window keeps the region, so it has to be deleted only after
+    //  the call has taken it over.
+    if (SetWindowRgn(hwnd, rgn, TRUE) == 0) DeleteObject(rgn);
 }
 
 bool Renderer::DumpPng(const UiModel& model, const Layout& layout, const std::wstring& path) {
@@ -944,9 +963,8 @@ bool Renderer::DumpPng(const UiModel& model, const Layout& layout, const std::ws
         g.Flush(Gdiplus::FlushIntentionSync);
     }
 
-    //  The dump is taken from the very same buffer that is handed to
-    //  UpdateLayeredWindow, so a screenshot proves what the screen
-    //  receives.  The DIB is bottom up, the PNG is top down.
+    //  The dump is taken from the very same buffer that is painted
+    //  into the window, so a screenshot proves what the screen shows.
     HDC screen = GetDC(nullptr);
     if (!screen) return false;
     DibSurface dib;
@@ -954,28 +972,26 @@ bool Renderer::DumpPng(const UiModel& model, const Layout& layout, const std::ws
         ReleaseDC(nullptr, screen);
         return false;
     }
-    ComposeToDib(frame, dib.bits, layout.width * 4);
+    ComposeOpaque(frame, dib.bits, layout.width * 4, 255);
+    ReleaseDC(nullptr, screen);
 
-    //  The PNG is written over a mid grey backdrop so that the
-    //  translucency of the panel is visible in the dump.  WritePngRgb
-    //  expects a premultiplied BGRA buffer.
+    //  WritePngRgb expects a premultiplied BGRA buffer; the surface
+    //  is already opaque, so the bytes are copied as they are.  The
+    //  corners are painted black, because the window region cuts them
+    //  out and the screen never shows them.
     std::vector<BYTE> bgra((size_t)layout.width * (size_t)layout.height * 4);
-    const int stride = layout.width * 4;
+    memcpy(bgra.data(), dib.bits, bgra.size());
+    const float radius = kCornerRadius * m_scale;
     for (int y = 0; y < (int)layout.height; ++y) {
-        const BYTE* s = dib.bits + (size_t)(layout.height - 1 - y) * stride;
-        BYTE* d = &bgra[((size_t)y * (size_t)layout.width) * 4];
         for (int x = 0; x < (int)layout.width; ++x) {
-            const BYTE a = s[3];
-            const int back = 24;   //  a mid grey desktop behind the bar
-            d[0] = (BYTE)((s[0] * a + back * (255 - a)) / 255);
-            d[1] = (BYTE)((s[1] * a + back * (255 - a)) / 255);
-            d[2] = (BYTE)((s[2] * a + back * (255 - a)) / 255);
-            d[3] = 255;
-            s += 4;
-            d += 4;
+            if (InsideRoundedRect((float)x + 0.5f, (float)y + 0.5f, 0.5f, 0.5f,
+                                  (float)layout.width - 1.0f, (float)layout.height - 1.0f,
+                                  radius))
+                continue;
+            BYTE* p = &bgra[((size_t)y * (size_t)layout.width + (size_t)x) * 4];
+            p[0] = p[1] = p[2] = 0;
         }
     }
-    ReleaseDC(nullptr, screen);
     return WritePngRgb(path, bgra.data(), layout.width, layout.height);
 }
 

@@ -52,14 +52,9 @@ row_height=30
 
 # --- Behaviour -----------------------------------------------------
 
-# Keep the bar above every other window.
-always_on_top=1
-
-# Fade the bar while it does not have the keyboard focus.
-dim_when_unfocused=1
-
-# How transparent the faded bar becomes, 0 (clear) to 255 (opaque).
-dim_alpha=70
+# How bright the bar is while it rests on the desktop, 0 to 255.
+# It is drawn at full brightness while it is being used.
+idle_brightness=220
 
 # Show the clock at the right end of the bar.
 show_clock=1

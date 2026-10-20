@@ -44,6 +44,7 @@ constexpr UINT       kScanDoneMsg  = WM_APP + 2;
 constexpr int        kHotkeyId     = 0xB01;
 constexpr int        kTimerCaret   = 1;
 constexpr int        kTimerClock   = 2;
+constexpr int        kTimerBand    = 3;
 constexpr int        kTraySearchId = 100;
 constexpr int        kTrayAutoId   = 101;
 constexpr int        kTrayQuitId   = 102;
@@ -60,11 +61,21 @@ struct AppState {
 
     HWND      hwnd = nullptr;
     HINSTANCE inst = nullptr;
+    //  The shell's desktop window.  The bar rests directly on top of
+    //  it, which is what keeps it out of the way of every program.
+    HWND      desktopHost = nullptr;
+    //  The window that had the focus before the bar was summoned, so
+    //  that it can be handed back when the bar goes away.
+    HWND      prevForeground = nullptr;
 
     std::wstring query;
     int         caret = 0;
 
     bool focused = false;
+    //  True while the bar is in use: it is on top, it has the focus
+    //  and it can be clicked.  When it is false the bar rests on the
+    //  desktop and lets the clicks through.
+    bool summoned = false;
     bool caretOn = true;
     int  activePane = 0;
     int  appSelected = 0;
@@ -85,6 +96,10 @@ struct AppState {
     std::wstring dumpPath;
     bool  selftest = false;
     bool  listApps = false;
+    //  A diagnostic: everything is logged and nothing is really
+    //  started, so the test can drive the whole program without
+    //  opening anything on the screen of the person at the keyboard.
+    bool  dryLaunch = false;
     std::wstring queryArg;
     bool  showPanel = true;
 };
@@ -109,6 +124,7 @@ void LogLine(const AppState& st, const std::string& line) {
     WriteFile(fh, blob.data(), (DWORD)blob.size(), &written, nullptr);
     CloseHandle(fh);
 }
+
 
 std::wstring SubLabelFor(const AppEntry& app) {
     switch (app.kind) {
@@ -231,16 +247,21 @@ UINT ParseHotkey(const std::wstring& spec) {
 //  Results
 //----------------------------------------------------------------------
 void RebuildResults(AppState& st) {
+    //  The selection keeps its place when the results are rebuilt, so
+    //  that the arrow keys are not thrown back to the first row after
+    //  every keystroke.
+    const int keepApp = st.appSelected;
+    const int keepWeb = st.webSelected;
+
     st.appResults.clear();
     st.webResults.clear();
-    st.appSelected = 0;
-    st.webSelected = 0;
 
     if (!st.scanDone.load(std::memory_order_acquire)) {
         //  The scan has not finished yet, so the left pane stays empty
         //  and only the providers are listed.
         BuildResults(st.query, st.index, st.providers, 0, st.cfg.maxProviderResults,
                      st.appResults, st.webResults);
+        st.appSelected = 0;
         st.webSelected = 0;
         return;
     }
@@ -274,6 +295,15 @@ void RebuildResults(AppState& st) {
             ++n;
         }
     }
+
+    st.appSelected = keepApp;
+    st.webSelected = keepWeb;
+    if (st.appSelected >= (int)st.appResults.size())
+        st.appSelected = (int)st.appResults.size() - 1;
+    if (st.appSelected < 0) st.appSelected = 0;
+    if (st.webSelected >= (int)st.webResults.size())
+        st.webSelected = (int)st.webResults.size() - 1;
+    if (st.webSelected < 0) st.webSelected = 0;
 }
 
 HICON IconFor(AppState& st, const Result& r) {
@@ -297,7 +327,7 @@ void SyncModel(AppState& st) {
     st.model.query = st.query;
     st.model.caret = st.caret;
     st.model.focused = st.focused;
-    st.model.panelOpen = st.focused && st.showPanel;
+    st.model.panelOpen = st.summoned && st.showPanel;
     st.model.caretOn = st.caretOn;
     st.model.activePane = st.activePane;
     st.model.clock = st.cfg.showClock ? ClockText() : L"";
@@ -379,10 +409,17 @@ void Redraw(AppState& st) {
     const Layout lay = st.renderer.ComputeLayout(st.model);
     int x = 0, y = 0;
     ComputePosition(st, lay, x, y);
-    SetWindowPos(st.hwnd, st.cfg.alwaysOnTop ? HWND_TOPMOST : HWND_TOP, x, y, lay.width, lay.height,
-                 SWP_NOACTIVATE | (st.cfg.alwaysOnTop ? 0 : SWP_NOZORDER));
-    const int alpha = (!st.focused && st.cfg.dimWhenUnfocused) ? st.cfg.dimAlpha : 255;
-    st.renderer.Present(st.hwnd, st.model, lay, alpha);
+    //  The z order is left alone here.  While the bar is in use it is
+    //  already on top of everything, and while it rests on the desktop
+    //  every repaint would push it back over the open applications.
+    //  Moving the foreground window about takes the foreground away
+    //  from it again, so it is not touched.
+    SetWindowPos(st.hwnd, nullptr, x, y, lay.width, lay.height,
+                 SWP_NOACTIVATE | SWP_NOZORDER);
+    //  The bar that rests on the desktop is a little softer than the
+    //  one that is being used.
+    const int fade = st.summoned ? 255 : st.cfg.idleBrightness;
+    st.renderer.Present(st.hwnd, st.model, lay, fade);
 }
 
 //----------------------------------------------------------------------
@@ -392,15 +429,16 @@ void LaunchAppAt(AppState& st, int index) {
     const std::vector<AppEntry> all = st.index.Snapshot();
     if (index < 0 || index >= (int)all.size()) return;
     const AppEntry& app = all[(size_t)index];
-    const bool ok = LaunchApp(app);
+    const bool ok = st.dryLaunch ? true : LaunchApp(app);
     {
         char line[512];
-        snprintf(line, sizeof(line), "launch app=%ls kind=%d aumid=%ls target=%ls ok=%d",
+        snprintf(line, sizeof(line),
+                 "launch app=%ls kind=%d aumid=%ls target=%ls ok=%d dry=%d",
                  app.name.c_str(), (int)app.kind, app.aumid.c_str(), app.target.c_str(),
-                 ok ? 1 : 0);
+                 ok ? 1 : 0, st.dryLaunch ? 1 : 0);
         LogLine(st, line);
     }
-    if (ok) st.index.RecordUse(app.name);
+    if (ok && !st.dryLaunch) st.index.RecordUse(app.name);
     st.query.clear();
     st.caret = 0;
     RebuildResults(st);
@@ -409,11 +447,12 @@ void LaunchAppAt(AppState& st, int index) {
 void OpenWebAt(AppState& st, int index) {
     if (index < 0 || index >= (int)st.providers.size()) return;
     const std::wstring url = BuildProviderUrl(st.providers[(size_t)index], st.query);
-    OpenUrl(url, st.cfg.defaultBrowser);
+    if (!st.dryLaunch) OpenUrl(url, st.cfg.defaultBrowser);
     {
         char line[512];
-        snprintf(line, sizeof(line), "open web provider=%ls url=%ls",
-                 st.providers[(size_t)index].label.c_str(), url.c_str());
+        snprintf(line, sizeof(line), "open web provider=%ls url=%ls dry=%d",
+                 st.providers[(size_t)index].label.c_str(), url.c_str(),
+                 st.dryLaunch ? 1 : 0);
         LogLine(st, line);
     }
     st.query.clear();
@@ -431,8 +470,103 @@ void ActivateSelection(AppState& st) {
     }
 }
 
-void FocusSearch(AppState& st) {
+//----------------------------------------------------------------------
+//  The desktop band
+//
+//  The bar rests on the desktop: above the wallpaper and the icons,
+//  below every application.  That is done with the z order.  The
+//  window is pushed to the very bottom and the shell's desktop window
+//  is then pushed below it, which leaves the bar directly on top of
+//  the desktop and under everything else.
+//
+//  The shell raises its desktop window now and then, so the band is
+//  checked once a second and put back when it has been lost.
+//----------------------------------------------------------------------
+HWND FindDesktopHost() {
+    HWND progman = FindWindowW(L"Progman", nullptr);
+    if (progman) return progman;
+    //  A fallback for the shells that hide the icons in a separate
+    //  view: the parent of that view is the desktop window.
+    HWND defView = FindWindowExW(nullptr, nullptr, L"SHELLDLL_DefView", nullptr);
+    if (defView) {
+        HWND parent = GetParent(defView);
+        if (parent) return parent;
+    }
+    return nullptr;
+}
+
+void PlaceInDesktopBand(AppState& st) {
     if (!st.hwnd) return;
+    if (!st.desktopHost) {
+        st.desktopHost = FindDesktopHost();
+        if (!st.desktopHost)
+            LogLine(st, "no desktop host found, the bar cannot rest on the desktop");
+    }
+    if (!st.desktopHost) return;
+
+    //  First to the very bottom, then the desktop window goes right
+    //  below the bar.
+    SetWindowPos(st.hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetWindowPos(st.desktopHost, st.hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+    LogLine(st, "on the desktop");
+}
+
+
+void RefreshDesktopBand(AppState& st) {
+    if (!st.hwnd || st.summoned) return;
+    if (!st.desktopHost) { PlaceInDesktopBand(st); return; }
+
+    //  The shell moves its own windows around now and then, and a few
+    //  invisible helpers sit in the band as well.  The only thing
+    //  that matters is that the desktop stays below the bar: if the
+    //  shell puts it on top, the bar is hidden behind the wallpaper
+    //  and has to be put back.
+    HWND above = st.hwnd;
+    for (int i = 0; i < 64 && above; ++i) {
+        above = GetWindow(above, GW_HWNDPREV);
+        if (!above) break;
+        if (above == st.desktopHost) {
+            PlaceInDesktopBand(st);
+            return;
+        }
+    }
+}
+
+//----------------------------------------------------------------------
+//  Summoning and dismissing
+//----------------------------------------------------------------------
+void SetClickThrough(AppState& st, bool clickThrough) {
+    if (!st.hwnd) return;
+    LONG_PTR ex = GetWindowLongPtrW(st.hwnd, GWL_EXSTYLE);
+    if (clickThrough)
+        ex |= WS_EX_TRANSPARENT;
+    else
+        ex &= ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
+    SetWindowLongPtrW(st.hwnd, GWL_EXSTYLE, ex);
+}
+
+//  Brings the bar up: on top of everything, with the focus, ready to
+//  be typed into.
+void Summon(AppState& st) {
+    if (!st.hwnd) return;
+
+    st.summoned = true;
+    st.focused = true;
+    st.showPanel = true;
+    st.activePane = 0;
+    st.caret = (int)st.query.size();
+    st.caretOn = true;
+
+    //  While it is in use the bar has to be clickable.
+    SetClickThrough(st, false);
+
+    //  The bar goes into the topmost band before it takes the
+    //  foreground.  A window that is the foreground and is moved to
+    //  another band afterwards loses the foreground again, and the bar
+    //  would be put away again straight away.
+    SetWindowPos(st.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
     //  The bar is a tool window, so it has to take the foreground
     //  away from whatever the user was working in.  Windows refuses
@@ -440,6 +574,7 @@ void FocusSearch(AppState& st) {
     //  input queues are attached to the foreground thread for the
     //  duration of the call.
     const HWND foreground = GetForegroundWindow();
+    if (foreground && foreground != st.hwnd) st.prevForeground = foreground;
     DWORD fgThread = 0;
     if (foreground) fgThread = GetWindowThreadProcessId(foreground, nullptr);
     const DWORD selfThread = GetCurrentThreadId();
@@ -453,12 +588,59 @@ void FocusSearch(AppState& st) {
     BringWindowToTop(st.hwnd);
 
     if (attached) AttachThreadInput(selfThread, fgThread, FALSE);
-    st.focused = true;
-    st.caret = (int)st.query.size();
-    st.caretOn = true;
+
+    //  Letting go of the input queue of the foreground thread can hand
+    //  the foreground back to the window that had it, so it is asked
+    //  for again.  Without this the bar comes up and is put away again
+    //  right away.
+    if (st.hwnd == GetForegroundWindow()) {
+        SetForegroundWindow(st.hwnd);
+        SetFocus(st.hwnd);
+    }
+
     RebuildResults(st);
     Redraw(st);
     SetTimer(st.hwnd, kTimerCaret, 500, nullptr);
+    LogLine(st, "summoned");
+}
+
+//  Puts the bar back on the desktop: no focus, no panel, no clicks
+//  and out of the topmost band.
+void Dismiss(AppState& st, const char* reason = "focus") {
+    if (!st.hwnd || !st.summoned) return;
+
+    st.summoned = false;
+    st.focused = false;
+    st.activePane = 0;
+    st.showPanel = false;
+    KillTimer(st.hwnd, kTimerCaret);
+
+    SetClickThrough(st, true);
+
+    //  The focus has to go back to the window that had it, otherwise
+    //  the keystrokes of the person at the keyboard would still land
+    //  in the bar that is no longer there.
+    if (GetForegroundWindow() == st.hwnd) {
+        HWND back = st.prevForeground;
+        if (back && back != st.hwnd && IsWindow(back)) {
+            SetForegroundWindow(back);
+        } else {
+            SetFocus(nullptr);
+        }
+    }
+
+    //  Out of the topmost band and back onto the desktop.
+    SetWindowPos(st.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    PlaceInDesktopBand(st);
+
+    RebuildResults(st);
+    Redraw(st);
+    {
+        char line[160];
+        snprintf(line, sizeof(line), "dismissed reason=%s", reason);
+        LogLine(st, line);
+    }
 }
 
 //----------------------------------------------------------------------
@@ -555,7 +737,7 @@ void ShowTrayMenu(AppState& st) {
     DestroyMenu(menu);
 
     if (cmd == kTraySearchId) {
-        FocusSearch(st);
+        Summon(st);
     } else if (cmd == kTrayAutoId) {
         const bool want = !IsAutostartEnabled();
         if (SetAutostartEnabled(want)) {
@@ -620,7 +802,9 @@ void OnKeyDown(AppState& st, WPARAM wp) {
                 st.query.clear();
                 st.caret = 0;
             } else {
-                SetFocus(nullptr);
+                //  Nothing left to clear, so the bar goes back to the
+                //  desktop.
+                Dismiss(st);
             }
             st.caretOn = true;
             RebuildResults(st);
@@ -660,6 +844,14 @@ void OnKeyDown(AppState& st, WPARAM wp) {
                 const int n = (int)st.webResults.size();
                 if (n > 0) st.webSelected = (st.webSelected + delta + n) % n;
             }
+            {
+                char line[160];
+                snprintf(line, sizeof(line), "nav key=%d pane=%d sel=%d apps=%d web=%d",
+                         (int)wp, st.activePane,
+                         st.activePane == 0 ? st.appSelected : st.webSelected,
+                         (int)st.appResults.size(), (int)st.webResults.size());
+                LogLine(st, line);
+            }
             break;
         }
         case VK_PRIOR:
@@ -687,7 +879,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     //  A second copy of the bar asked the first one to come up.
     if (g_showMessage != 0 && msg == g_showMessage) {
-        if (st) FocusSearch(*st);
+        if (st) Summon(*st);
         return 0;
     }
     if (!st) return DefWindowProcW(hwnd, msg, wp, lp);
@@ -698,14 +890,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_ERASEBKGND:
-            return 1;   //  the surface is layered, there is no background
+            return 1;   //  the whole surface is painted, there is no background
 
-        case WM_PAINT: {
-            PAINTSTRUCT ps;
-            BeginPaint(hwnd, &ps);
-            EndPaint(hwnd, &ps);
-            return 0;
-        }
+        case WM_NCHITTEST:
+            //  While the bar rests on the desktop it lets every click
+            //  through to whatever is underneath it.
+            if (!st->summoned) return HTTRANSPARENT;
+            return DefWindowProcW(hwnd, msg, wp, lp);
 
         case WM_SETFOCUS:
             st->focused = true;
@@ -718,12 +909,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_KILLFOCUS:
             //  The query is kept: losing the focus by accident should
-            //  not throw away what was typed.
-            st->focused = false;
-            st->activePane = 0;
-            KillTimer(hwnd, kTimerCaret);
-            RebuildResults(*st);
-            Redraw(*st);
+            //  not throw away what was typed.  The bar goes back to
+            //  the desktop, which is where it belongs when it is not
+            //  being used.
+            Dismiss(*st);
             return 0;
 
         case WM_CHAR:
@@ -824,6 +1013,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (wp == kTimerClock) {
                 const std::wstring now = st->cfg.showClock ? ClockText() : L"";
                 if (now != st->model.clock) Redraw(*st);
+            } else if (wp == kTimerBand) {
+                //  The shell raises its desktop window now and then,
+                //  so the band is put back when it has been lost.
+                RefreshDesktopBand(*st);
             }
             return 0;
         }
@@ -831,20 +1024,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_HOTKEY:
             if (wp == (WPARAM)kHotkeyId) {
-                FocusSearch(*st);
+                //  The hotkey is a switch: it brings the bar up, and
+                //  it puts it away again when it is already up.
+                if (st->summoned) Dismiss(*st, "hotkey");
+                else Summon(*st);
             }
             return 0;
 
         case kScanDoneMsg:
             //  The application list is complete now, so the panes are
             //  built again with everything in them.
+            {
+                char line[128];
+                snprintf(line, sizeof(line), "scan done apps=%d",
+                         (int)st->index.Size());
+                LogLine(*st, line);
+            }
             RebuildResults(*st);
             Redraw(*st);
             return 0;
 
         case kTrayMessage: {
             if (lp == WM_LBUTTONUP || lp == WM_LBUTTONDBLCLK) {
-                FocusSearch(*st);
+                Summon(*st);
             } else if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) {
                 ShowTrayMenu(*st);
             }
@@ -853,7 +1055,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_COMMAND: {
             const int id = LOWORD(wp);
-            if (id == kTraySearchId) FocusSearch(*st);
+            if (id == kTraySearchId) Summon(*st);
             else if (id == kTrayAutoId) {
                 const bool want = !IsAutostartEnabled();
                 if (SetAutostartEnabled(want)) {
@@ -968,6 +1170,7 @@ int Run(HINSTANCE instance, const std::wstring& cmdLine) {
         else if (a == L"--install-autostart") installAuto = true;
         else if (a == L"--uninstall-autostart") uninstallAuto = true;
         else if (a == L"--list-apps") st.listApps = true;
+        else if (a == L"--dry-launch") st.dryLaunch = true;
         else if (a == L"--query" && i + 1 < args.size()) st.queryArg = args[++i];
     }
 
@@ -1070,8 +1273,13 @@ int Run(HINSTANCE instance, const std::wstring& cmdLine) {
         return 0;
     }
 
-    DWORD exStyle = WS_EX_LAYERED | WS_EX_TOOLWINDOW;
-    if (st.cfg.alwaysOnTop) exStyle |= WS_EX_TOPMOST;
+    //  The bar is an ordinary window on purpose.  A layered window is
+    //  composited by the desktop window manager in a pass of its own,
+    //  after the ordinary windows, so it would float above every
+    //  application whatever the z order says.  This one obeys the z
+    //  order, which is what lets it rest on the desktop.  While it
+    //  rests there it also lets the clicks through.
+    DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT;
 
     st.hwnd = CreateWindowExW(exStyle, wc.lpszClassName, L"JARVIS Search", WS_POPUP, 0, 0,
                               (int)st.cfg.barWidth, (int)st.cfg.barHeight, nullptr, nullptr,
@@ -1103,8 +1311,12 @@ int Run(HINSTANCE instance, const std::wstring& cmdLine) {
     });
 
     st.focused = false;
+    st.summoned = false;
     Redraw(st);
     ShowWindow(st.hwnd, SW_SHOWNOACTIVATE);
+    //  The bar starts where it belongs: on the desktop, under every
+    //  application window.
+    PlaceInDesktopBand(st);
     {
         char line[256];
         RECT r{};
@@ -1115,6 +1327,7 @@ int Run(HINSTANCE instance, const std::wstring& cmdLine) {
         LogLine(st, line);
     }
     SetTimer(st.hwnd, kTimerClock, 1000, nullptr);
+    SetTimer(st.hwnd, kTimerBand, 1000, nullptr);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

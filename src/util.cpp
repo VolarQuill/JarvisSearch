@@ -254,12 +254,8 @@ void ApplyConfigKey(const std::wstring& key, const std::wstring& val, Config& cf
         cfg.maxProviderResults = ParseInt(val, cfg.maxProviderResults);
     } else if (k == L"row_height") {
         cfg.rowHeight = ParseInt(val, cfg.rowHeight);
-    } else if (k == L"always_on_top") {
-        ParseBool(val, cfg.alwaysOnTop);
-    } else if (k == L"dim_when_unfocused") {
-        ParseBool(val, cfg.dimWhenUnfocused);
-    } else if (k == L"dim_alpha") {
-        cfg.dimAlpha = ParseInt(val, cfg.dimAlpha);
+    } else if (k == L"idle_brightness") {
+        cfg.idleBrightness = ParseInt(val, cfg.idleBrightness);
     } else if (k == L"show_clock") {
         ParseBool(val, cfg.showClock);
     } else if (k == L"show_tray") {

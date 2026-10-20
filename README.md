@@ -76,7 +76,7 @@ all, it runs on a bare Windows install.
 
 | Key | What it does |
 | --- | --- |
-| `Ctrl` + `Alt` + `Space` | bring the bar up and focus it (change with `hotkey=`) |
+| `Ctrl` + `Alt` + `Space` | bring the bar up and focus it, or put it away again (change with `hotkey=`) |
 | type | filter the applications and the providers |
 | `Enter` | launch the selected entry |
 | `Tab` | switch between the two panes |
@@ -84,8 +84,11 @@ all, it runs on a bare Windows install.
 | `Ctrl` + `1..9` | launch the numbered application directly |
 | `Esc` | clear the query, and give the focus back |
 
-Clicking an entry does the same as `Enter`. The bar also has a notification
-area icon: left click focuses it, right click opens the menu.
+The bar rests on the desktop, on top of the wallpaper and under every open
+application. The hotkey lifts it above everything and hands it the keyboard;
+when it loses the focus it goes back down to the desktop, and the hotkey puts
+it away as well. Clicking an entry does the same as `Enter`. The bar also has
+a notification area icon: left click focuses it, right click opens the menu.
 
 ## Configuration
 
@@ -105,9 +108,7 @@ setting has a built in default, so the file is optional.
 | `max_app_results` | `9` | rows in the application pane |
 | `max_provider_results` | `12` | rows in the web pane |
 | `row_height` | `30` | height of one result row |
-| `always_on_top` | `1` | stay above every other window |
-| `dim_when_unfocused` | `1` | fade the bar when it does not have the focus |
-| `dim_alpha` | `70` | how far it fades, 0 (clear) to 255 (opaque) |
+| `idle_brightness` | `220` | how bright the bar is while it rests, 0 to 255 |
 | `show_clock` | `1` | clock at the right end of the bar |
 | `show_tray` | `1` | notification area icon |
 | `autostart` | `1` | start with Windows |
@@ -121,7 +122,7 @@ setting has a built in default, so the file is optional.
 ```
 src/jarvis.h        the shared types: config, app entries, providers, results
 src/main.cpp        the window, the keyboard, the tray icon, the actions
-src/render.h/.cpp   the drawing: layout, GDI+ painting, the layered window
+src/render.h/.cpp   the drawing: layout, GDI+ painting, the surface
 src/apps.cpp        finding the applications, launching them, their icons
 src/fuzzy.cpp       the matching and the ranking of the two panes
 src/providers.cpp   the table of web search providers
@@ -129,13 +130,17 @@ src/util.cpp        config files, paths, strings
 tools/acceptance.ps1 the test that drives the real program
 ```
 
-* **The window is layered.** The bar is drawn on a 32 bit ARGB surface, turned
-  into premultiplied alpha and pushed to the screen with
-  `UpdateLayeredWindow(ULW_ALPHA)`, which is what gives the panel true per
-  pixel transparency.
-* **The text input is hand written.** A child control cannot be composited
-  into a layered window, so the query field is not a control: the characters
-  come in through `WM_CHAR` and are kept in a string.
+* **The window is an ordinary window, not a layered one.** A layered window is
+  composited by the desktop after everything else, so it floats above every
+  application. This bar does the opposite: it is pushed to the bottom of the
+  z order and the shell's desktop window is pushed right below it, which
+  leaves the bar on the wallpaper, under the open applications.
+* **It is opaque.** The bar is painted on a 32 bit surface that is blitted to
+  the window, so nothing of the desktop shows through it. While it rests its
+  contents are mixed a little towards the colour of the card
+  (`idle_brightness`), which is what gives it the soft look.
+* **The text input is hand written.** The query field is not a control: the
+  characters come in through `WM_CHAR` and are kept in a string.
 * **The applications come out of the shell.** The Start menu is walked for
   `.lnk` files, the Store applications are read from `shell:AppsFolder`, and
   a Store application is started through `IApplicationActivationManager`.
@@ -155,11 +160,12 @@ JarvisSearch.exe --query "notepad"              # write what a query matches to 
 ## The test
 
 `tools/acceptance.ps1` drives the real program and checks what it actually
-does: that the window is there, that it is layered and on top, that the
-global hotkey is free, that the characters reach the query field, that the
-application that is found really starts, that a web search carries the query
-in the url, that escape clears the query and that a second copy of the
-program steps aside.
+does: that the window is there, that it rests on the desktop, that the global
+hotkey is free, that the characters reach the query field, that the arrow keys
+move the selection, that the application that is found really starts, that a
+web search carries the query in the url, that escape clears the query, that
+the bar comes up on the hotkey and that a second copy of the program steps
+aside.
 
 ```
 powershell -ExecutionPolicy Bypass -File .\tools\acceptance.ps1

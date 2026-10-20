@@ -59,9 +59,10 @@ struct Config {
     int         rowHeight      = 30;    //  logical px per result row
 
     //  Behaviour
-    bool        alwaysOnTop    = true;
-    bool        dimWhenUnfocused = true; //  fade the bar when it loses focus
-    int         dimAlpha       = 70;     //  0-255 alpha of the dimmed bar
+    //  The bar rests on the desktop as a solid card.  This is how
+    //  bright its contents are while it is resting there; it is drawn
+    //  at full brightness while it is being used.
+    int         idleBrightness = 220;
     bool        showClock      = true;
     bool        showTray       = true;
     bool        autostart      = true;   //  register the Run entry on start-up

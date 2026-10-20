@@ -1,9 +1,15 @@
 //======================================================================
 //  JARVIS SEARCH  -  the view layer.
 //
-//  Everything the user sees is drawn from code with GDI+ primitives on
-//  a per-pixel alpha surface that is pushed to the screen with
-//  UpdateLayeredWindow.  No bitmap or sprite asset is shipped.
+//  Everything the user sees is drawn from code with GDI+ primitives.
+//  No bitmap or sprite asset is shipped.
+//
+//  The frame is composed on a 32 bit ARGB surface and then flattened
+//  onto an opaque one, because the bar is an ordinary window that has
+//  to sit in the desktop band below every application.  An ordinary
+//  window cannot be translucent, so the panel is solid and the parts
+//  of it that are meant to be soft are mixed towards the card colour
+//  instead.
 //
 //  The renderer owns the layout: it computes where every pane, header
 //  and row sits, and hands that layout back to the controller so that
@@ -89,6 +95,28 @@ struct Layout {
 };
 
 //======================================================================
+//  A 32 bit DIB section plus the memory DC that holds it.
+//
+//  The surface is top down, so the image rows are stored the way they
+//  are drawn and the window can be painted with a plain BitBlt.
+//======================================================================
+struct DibSurface {
+    HDC      dc   = nullptr;
+    HBITMAP  bmp  = nullptr;
+    HGDIOBJ  old  = nullptr;
+    BYTE*    bits = nullptr;
+    int      w = 0, h = 0;
+
+    bool Create(HDC screen, int width, int height);
+    void Destroy();
+
+    ~DibSurface() { Destroy(); }
+    DibSurface() = default;
+    DibSurface(const DibSurface&) = delete;
+    DibSurface& operator=(const DibSurface&) = delete;
+};
+
+//======================================================================
 //  Renderer
 //======================================================================
 class Renderer {
@@ -110,10 +138,18 @@ public:
     //  pixels and is the single source of truth for hit testing.
     Layout ComputeLayout(const UiModel& model) const;
 
-    //  Draws the model and pushes it to the window as a layered
-    //  surface.  `alpha` scales the whole frame, which is how the bar
-    //  dims when it is not focused.
-    bool Present(HWND hwnd, const UiModel& model, const Layout& layout, int alpha);
+    //  Draws the model into the window surface and asks for a repaint.
+    //  `fade` mixes the finished frame towards the card colour: 255
+    //  is the bar at full brightness, less makes it dissolve into the
+    //  desktop while it rests there.
+    bool Present(HWND hwnd, const UiModel& model, const Layout& layout, int fade);
+
+    //  Paints the surface that Present prepared.  Called from WM_PAINT.
+    void Blit(HWND hwnd);
+
+    //  Clips the window to a rounded rectangle, so that the corners of
+    //  the card are cut out of an ordinary, opaque window.
+    void ApplyRegion(HWND hwnd, const Layout& layout);
 
     //  Writes the current model to a PNG file.  Used by the self test
     //  and by the screenshot tooling; never called at runtime.
@@ -148,11 +184,12 @@ private:
                     float tracking);
     void DrawBracket(Gdiplus::Graphics& g, const RectI& r, const Gdiplus::Color& color);
 
-    //  Converts the composed surface into the premultiplied form
-    //  UpdateLayeredWindow requires.  GDI+ may store either straight or
+    //  Converts the composed surface into an opaque one: the alpha is
+    //  resolved against the card colour and the result is mixed
+    //  towards it by `fade`.  GDI+ may store either straight or
     //  premultiplied samples in a 32bppARGB surface, so the convention
     //  is probed once at start-up.
-    void ComposeToDib(Gdiplus::Bitmap& src, BYTE* dst, int dstStride);
+    void ComposeOpaque(Gdiplus::Bitmap& src, BYTE* dst, int dstStride, int fade);
     bool ProbeGdiAlpha();
 
     //  Type
@@ -177,6 +214,7 @@ private:
     bool                      m_gdiPremultiplies = true;
     int                       m_lastWidth = 0;
     int                       m_lastHeight = 0;
+    DibSurface                m_surface;
 };
 
 }  // namespace js
