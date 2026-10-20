@@ -514,6 +514,15 @@ void ComputePosition(AppState& st, const Layout& lay, int& outX, int& outY) {
         x = wa.left + (wa.right - wa.left - w) / 2;
         y = wa.top + (wa.bottom - wa.top - h) / 2;
     }
+
+    //  An exact place wins over the named corner.  The desktop icons
+    //  sit along the top of the screen and the greeting card of the
+    //  sibling HUD sits in the top left corner, so the bar is put
+    //  below the icons and to the right of the card that way.
+    const float scale = st.renderer.Scale();
+    if (st.cfg.posX >= 0) x = wa.left + (int)std::lround((float)st.cfg.posX * scale);
+    if (st.cfg.posY >= 0) y = wa.top  + (int)std::lround((float)st.cfg.posY * scale);
+
     outX = x;
     outY = y;
 }

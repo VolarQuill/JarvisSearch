@@ -51,10 +51,14 @@ struct Config {
 
     //  Geometry
     //  The sibling JARVIS HUD greeting card lives in the top left
-    //  corner, so the bar sits in the top right one: the two panels
-    //  must not sit on top of each other.
+    //  corner and the desktop icons sit along the top, so the bar is
+    //  put just below the icons and to the right of the card.  The
+    //  exact place can be given in pos_x / pos_y; when they are left
+    //  at -1 the named corner in "position" is used instead.
     std::wstring position      = L"top-right";
     int         margin         = 24;    //  logical px from the work-area edge
+    int         posX           = -1;    //  logical px from the work-area left
+    int         posY           = -1;    //  logical px from the work-area top
     int         barWidth       = 680;   //  logical px
     int         barHeight      = 48;    //  logical px
     int         maxAppResults  = 9;     //  rows shown in the left pane

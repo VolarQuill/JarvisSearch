@@ -244,6 +244,10 @@ void ApplyConfigKey(const std::wstring& key, const std::wstring& val, Config& cf
         cfg.position = LowerAscii(val);
     } else if (k == L"margin") {
         cfg.margin = ParseInt(val, cfg.margin);
+    } else if (k == L"pos_x") {
+        cfg.posX = ParseInt(val, cfg.posX);
+    } else if (k == L"pos_y") {
+        cfg.posY = ParseInt(val, cfg.posY);
     } else if (k == L"bar_width") {
         cfg.barWidth = ParseInt(val, cfg.barWidth);
     } else if (k == L"bar_height") {

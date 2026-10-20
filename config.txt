@@ -35,10 +35,20 @@ status_text=SYSTEM ONLINE
 # One of: top-center, top-left, top-right, bottom-center,
 #         bottom-left, bottom-right, center.
 #
-# The JARVIS HUD greeting card sits in the top left corner, so the bar
-# goes to the top right one. The two panels must not sit on top of
-# each other.
+# The JARVIS HUD greeting card sits in the top left corner and the
+# desktop icons sit along the top, so the bar is put just below the
+# icons and to the right of the card. That place is given exactly by
+# pos_x and pos_y below, which win over "position".
 position=top-right
+
+# The exact place of the bar, in logical pixels from the top left
+# corner of the work area.  -1 means "use the corner named by
+# position above".
+#
+# 624, 94 puts the bar under the row of desktop icons (the first
+# icon column starts at 624) and to the right of the greeting card.
+pos_x=624
+pos_y=94
 
 # Distance in logical pixels from the edge of the work area.
 margin=24
